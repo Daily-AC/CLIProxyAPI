@@ -43,7 +43,10 @@ type Options struct {
 
 // state is one immutable snapshot of owner settings and friend keys.
 type state struct {
-	owner   *config.Config
+	owner *config.Config
+	// parsed is the last accepted friends.yaml content.
+	parsed *FriendSet
+	// friends is parsed minus entries whose key equals an owner key.
 	friends *FriendSet
 }
 
@@ -89,7 +92,7 @@ func NewRuntime(opts Options) *Runtime {
 		onReload:    opts.OnWatchReload,
 		done:        make(chan struct{}),
 	}
-	rt.state.Store(&state{owner: &config.Config{}, friends: emptyFriendSet()})
+	rt.state.Store(&state{owner: &config.Config{}, parsed: emptyFriendSet(), friends: emptyFriendSet()})
 	rt.mgmt = sdkapi.NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
 	rt.usage = NewUsageStore(filepath.Join(dir, UsageFileName), now, opts.FlushDelay)
 	if errReload := rt.Reload(); errReload != nil {
@@ -112,7 +115,9 @@ func (rt *Runtime) Usage() *UsageStore {
 }
 
 // Reload re-reads config.yaml (owner keys and management settings) and friends.yaml.
-// On a parse or validation error the previous good snapshot of that file is kept.
+// On a parse or validation error the previous good snapshot of that file is kept. Friend
+// entries whose key equals an owner key are dropped on every reload, so an owner key is
+// never restricted; the remaining entries stay active.
 func (rt *Runtime) Reload() error {
 	rt.reloadMu.Lock()
 	defer rt.reloadMu.Unlock()
@@ -124,31 +129,54 @@ func (rt *Runtime) Reload() error {
 		owner = previous.owner
 	}
 
-	friends, errFriends := loadFriends(rt.friendsPath, owner.APIKeys)
+	parsed, errFriends := loadFriends(rt.friendsPath)
 	if errFriends != nil {
 		log.WithError(errFriends).Error("z10: friends.yaml rejected; keeping last good friend keys")
-		friends = previous.friends
+		parsed = previous.parsed
 	}
+	friends, dropped := parsed.withoutKeys(owner.APIKeys)
+	var errCollision error
+	if len(dropped) > 0 {
+		errCollision = fmt.Errorf("friend keys equal to owner api keys were disabled: %s", strings.Join(dropped, ", "))
+		log.WithField("friends", dropped).Error("z10: friend keys equal to owner api keys were disabled")
+	}
+	warnUnknownChannels(friends, owner)
 
-	rt.state.Store(&state{owner: owner, friends: friends})
+	rt.state.Store(&state{owner: owner, parsed: parsed, friends: friends})
 	if owner != previous.owner {
 		rt.mgmt.SetConfig(owner)
 	}
-	if errFriends == nil && friendSetSummary(friends) != friendSetSummary(previous.friends) {
+	if friendSetSummary(friends) != friendSetSummary(previous.friends) {
 		log.WithField("friends", friends.Len()).Info("z10: friend keys loaded")
 	}
-	return errors.Join(errOwner, errFriends)
+	return errors.Join(errOwner, errFriends, errCollision)
+}
+
+// warnUnknownChannels logs channels that name no openai-compatibility entry. Such a
+// channel grants nothing, so this is a hint for typos, not an error.
+func warnUnknownChannels(friends *FriendSet, owner *config.Config) {
+	known := make(map[string]struct{}, len(owner.OpenAICompatibility))
+	for _, compat := range owner.OpenAICompatibility {
+		known[channelProviderKey(compat.Name)] = struct{}{}
+	}
+	for _, friend := range friends.Friends() {
+		for _, channel := range friend.Channels {
+			if _, ok := known[channelProviderKey(channel)]; !ok {
+				log.WithFields(log.Fields{"friend": friend.Name, "channel": channel}).Warn("z10: channel matches no openai-compatibility entry")
+			}
+		}
+	}
 }
 
 func friendSetSummary(set *FriendSet) string {
 	var b strings.Builder
 	for _, friend := range set.Friends() {
-		fmt.Fprintf(&b, "%s|%v|%s|%s;", friend.Name, friend.Enabled, friend.ExpiresRaw, strings.Join(friend.Models, ","))
+		fmt.Fprintf(&b, "%s|%v|%s|%s|%s;", friend.Name, friend.Enabled, friend.ExpiresRaw, strings.Join(friend.Models, ","), strings.Join(friend.Channels, ","))
 	}
 	return b.String()
 }
 
-func loadFriends(path string, ownerKeys []string) (*FriendSet, error) {
+func loadFriends(path string) (*FriendSet, error) {
 	data, errRead := os.ReadFile(path)
 	if errors.Is(errRead, fs.ErrNotExist) {
 		return emptyFriendSet(), nil
@@ -156,7 +184,7 @@ func loadFriends(path string, ownerKeys []string) (*FriendSet, error) {
 	if errRead != nil {
 		return nil, fmt.Errorf("read %s: %w", FriendsFileName, errRead)
 	}
-	return ParseFriends(data, ownerKeys)
+	return ParseFriends(data)
 }
 
 // loadOwnerConfig parses config.yaml (legacy or v8 layout) without the side effects of

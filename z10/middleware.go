@@ -2,16 +2,14 @@ package z10
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -28,16 +26,21 @@ const (
 type friendRoute struct {
 	kind  routeKind
 	param string
+	// decodes is true when the handler reads the body with handlers.ReadRequestBody,
+	// which decodes zstd; other handlers parse the raw bytes.
+	decodes bool
+	// claudeIDs is true when the handler decodes Claude list-cloaked model IDs.
+	claudeIDs bool
 }
 
 // friendRoutes is the endpoint allowlist for friend keys, keyed by method and the matched
 // gin route pattern. Everything else is denied, including routes added upstream later.
 var friendRoutes = map[string]friendRoute{
-	"POST /v1/chat/completions":      {kind: routeBodyModel},
-	"POST /v1/completions":           {kind: routeBodyModel},
-	"POST /v1/messages":              {kind: routeBodyModel},
-	"POST /v1/messages/count_tokens": {kind: routeBodyModel},
-	"POST /v1/responses":             {kind: routeBodyModel},
+	"POST /v1/chat/completions":      {kind: routeBodyModel, decodes: true},
+	"POST /v1/completions":           {kind: routeBodyModel, decodes: true},
+	"POST /v1/responses":             {kind: routeBodyModel, decodes: true},
+	"POST /v1/messages":              {kind: routeBodyModel, claudeIDs: true},
+	"POST /v1/messages/count_tokens": {kind: routeBodyModel, claudeIDs: true},
 	"GET /v1/models":                 {kind: routeModelList},
 	"GET /v1/models/*model":          {kind: routeModelDetail, param: "model"},
 	"GET /v1beta/models":             {kind: routeModelList},
@@ -47,9 +50,6 @@ var friendRoutes = map[string]friendRoute{
 
 // geminiMethods mirrors the methods dispatched by the Gemini handler.
 var geminiMethods = map[string]bool{"generateContent": true, "streamGenerateContent": true, "countTokens": true}
-
-// maxGzipBodyBytes caps the extra gzip view used only for model inspection.
-const maxGzipBodyBytes = 64 << 20
 
 // Middleware enforces friend key restrictions. It runs before the route-group auth
 // middleware; requests without a friend key pass through untouched.
@@ -65,13 +65,16 @@ func (rt *Runtime) Middleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": reason})
 			return
 		}
+		// The access provider accepts the key only with this marker, so a key that
+		// becomes a friend key between this check and authentication is rejected.
+		c.Request = c.Request.WithContext(withFriendMarker(c.Request.Context(), friend))
 		if isUpgradeRequest(c.Request) {
-			rt.deny(c, friend, http.StatusForbidden, "websocket_not_allowed", "WebSocket and protocol upgrades are not allowed for this API key")
+			rt.deny(c, friend, newGateError(http.StatusForbidden, "websocket_not_allowed", "WebSocket and protocol upgrades are not allowed for this API key"))
 			return
 		}
 		route, allowed := friendRoutes[c.Request.Method+" "+c.FullPath()]
 		if !allowed {
-			rt.deny(c, friend, http.StatusForbidden, "endpoint_not_allowed", fmt.Sprintf("%s %s is not allowed for this API key", c.Request.Method, c.Request.URL.Path))
+			rt.deny(c, friend, newGateError(http.StatusForbidden, "endpoint_not_allowed", "%s %s is not allowed for this API key", c.Request.Method, c.Request.URL.Path))
 			return
 		}
 
@@ -81,7 +84,7 @@ func (rt *Runtime) Middleware() gin.HandlerFunc {
 			rt.usage.Touch(friend.Name)
 			return
 		case routeModelDetail:
-			if !friend.Allows(strings.TrimPrefix(c.Param(route.param), "/")) {
+			if !friend.listedModelAllowed(strings.TrimPrefix(c.Param(route.param), "/")) {
 				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "Model not found", "type": "invalid_request_error", "code": "model_not_found"}})
 				return
 			}
@@ -90,48 +93,74 @@ func (rt *Runtime) Middleware() gin.HandlerFunc {
 			return
 		}
 
-		var pathModel string
-		if route.kind == routeGeminiAction {
-			parts := strings.Split(strings.TrimPrefix(c.Param(route.param), "/"), ":")
-			if len(parts) != 2 || !geminiMethods[parts[1]] {
-				rt.deny(c, friend, http.StatusForbidden, "endpoint_not_allowed", fmt.Sprintf("%s %s is not allowed for this API key", c.Request.Method, c.Request.URL.Path))
-				return
-			}
-			pathModel = parts[0]
-		}
-		primary, models, errRead := inspectRequestModels(c, pathModel)
-		if errRead != nil {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: failed to read body", "type": "invalid_request_error"}})
+		routerModel, gateErr := gateModelRequest(c, friend, route)
+		if gateErr != nil {
+			rt.deny(c, friend, gateErr)
 			return
 		}
-		if primary == "" {
-			rt.deny(c, friend, http.StatusBadRequest, "model_required", "request does not specify a model")
-			return
-		}
-		for _, model := range models {
-			if !friend.Allows(model) {
-				rt.deny(c, friend, http.StatusForbidden, "model_not_allowed", fmt.Sprintf("model %q is not allowed for this API key", model))
-				return
-			}
-		}
-
 		c.Next()
-		rt.usage.RecordRequest(friend.Name, NormalizeModel(primary), c.Writer.Status() >= http.StatusBadRequest)
+		rt.usage.RecordRequest(friend.Name, NormalizeModel(routerModel), c.Writer.Status() >= http.StatusBadRequest)
 	}
 }
 
-func (rt *Runtime) deny(c *gin.Context, friend *Friend, status int, code, message string) {
+// gateModelRequest validates the body of a model request, restores the original bytes
+// for the handler, and checks every model the request names. It returns the model the
+// router will resolve.
+func gateModelRequest(c *gin.Context, friend *Friend, route friendRoute) (string, *gateError) {
+	var pathModel string
+	if route.kind == routeGeminiAction {
+		parts := strings.Split(strings.TrimPrefix(c.Param(route.param), "/"), ":")
+		if len(parts) != 2 || !geminiMethods[parts[1]] {
+			return "", newGateError(http.StatusForbidden, "endpoint_not_allowed", "%s %s is not allowed for this API key", c.Request.Method, c.Request.URL.Path)
+		}
+		pathModel = parts[0]
+	}
+
+	raw, effective, gateErr := readFriendBody(c.Request, route.decodes)
+	if raw != nil {
+		restoreBody(c, raw)
+	}
+	if gateErr != nil {
+		return "", gateErr
+	}
+	bodyModelName, present, gateErr := bodyModel(effective)
+	if gateErr != nil {
+		return "", gateErr
+	}
+
+	if route.kind == routeGeminiAction {
+		// The Gemini handler routes on the path; a body model must still be allowed.
+		if present {
+			if gateErr = friend.checkModel(bodyModelName); gateErr != nil {
+				return "", gateErr
+			}
+		}
+		return pathModel, friend.checkModel(pathModel)
+	}
+
+	if !present || bodyModelName == "" {
+		return "", newGateError(http.StatusBadRequest, "model_required", "request does not specify a model")
+	}
+	routerModel := bodyModelName
+	if route.claudeIDs {
+		routerModel = claudemodels.ResolveClaudeModelIDPrefix(bodyModelName)
+	}
+	return routerModel, friend.checkModel(routerModel)
+}
+
+func (rt *Runtime) deny(c *gin.Context, friend *Friend, gateErr *gateError) {
 	log.WithFields(log.Fields{
 		"friend": friend.Name,
 		"method": c.Request.Method,
 		"path":   c.Request.URL.Path,
-		"code":   code,
+		"code":   gateErr.code,
 	}).Info("z10: friend key request denied")
 	errType := "permission_error"
-	if status == http.StatusBadRequest {
+	switch gateErr.status {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType:
 		errType = "invalid_request_error"
 	}
-	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"message": message, "type": errType, "code": code}})
+	c.AbortWithStatusJSON(gateErr.status, gin.H{"error": gin.H{"message": gateErr.message, "type": errType, "code": gateErr.code}})
 }
 
 // isUpgradeRequest detects WebSocket and other protocol upgrades. The model of a
@@ -153,84 +182,8 @@ func isUpgradeRequest(r *http.Request) bool {
 	return false
 }
 
-// inspectRequestModels collects every model the request may name and restores the
-// original body bytes. The body is inspected as raw bytes (what the Claude and Gemini
-// handlers parse), as decoded by handlers.ReadRequestBody (what the OpenAI handlers
-// parse), and gunzipped; every model found in any view must be allowed, so a payload
-// that decodes differently per parser cannot smuggle a second model past the check.
-// primary is the model used for usage accounting.
-func inspectRequestModels(c *gin.Context, pathModel string) (primary string, models []string, err error) {
-	raw, errRead := c.GetRawData()
-	if errRead != nil {
-		return "", nil, errRead
-	}
-	restoreBody(c, raw)
-	views := [][]byte{raw}
-	if decoded, errDecode := handlers.ReadRequestBody(c); errDecode == nil && !bytes.Equal(decoded, raw) {
-		views = append(views, decoded)
-	}
-	restoreBody(c, raw)
-	if gunzipped, ok := gunzipView(raw, c.Request.Header.Get("Content-Encoding")); ok {
-		views = append(views, gunzipped)
-	}
-
-	if pathModel != "" {
-		primary = pathModel
-		models = append(models, pathModel)
-	}
-	// Prefer the decoded view for accounting: it is what the OpenAI handlers route on.
-	for index := len(views) - 1; index >= 0; index-- {
-		found := modelsInBody(views[index])
-		models = append(models, found...)
-		if primary == "" {
-			for _, model := range found {
-				if strings.TrimSpace(model) != "" {
-					primary = model
-					break
-				}
-			}
-		}
-	}
-	return primary, models, nil
-}
-
 func restoreBody(c *gin.Context, raw []byte) {
 	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
-}
-
-// modelsInBody returns the top-level "model" value as gjson resolves it (the parser used
-// by the handlers) plus every top-level "model" key, which catches duplicate keys that
-// other JSON parsers would resolve differently.
-func modelsInBody(body []byte) []string {
-	var out []string
-	if result := gjson.GetBytes(body, "model"); result.Exists() {
-		out = append(out, result.String())
-	}
-	if root := gjson.ParseBytes(body); root.IsObject() {
-		root.ForEach(func(key, value gjson.Result) bool {
-			if key.String() == "model" {
-				out = append(out, value.String())
-			}
-			return true
-		})
-	}
-	return out
-}
-
-func gunzipView(raw []byte, encoding string) ([]byte, bool) {
-	if !strings.EqualFold(strings.TrimSpace(encoding), "gzip") {
-		return nil, false
-	}
-	reader, errReader := gzip.NewReader(bytes.NewReader(raw))
-	if errReader != nil {
-		return nil, false
-	}
-	defer func() { _ = reader.Close() }()
-	data, errRead := io.ReadAll(io.LimitReader(reader, maxGzipBodyBytes+1))
-	if errRead != nil || len(data) > maxGzipBodyBytes {
-		return nil, false
-	}
-	return data, true
 }
 
 // serveFilteredModelList buffers the model list written by the handler and rewrites it
@@ -279,7 +232,7 @@ func filterModelList(body []byte, friend *Friend) []byte {
 		_ = json.Unmarshal(rawEntries, &entries)
 		kept := make([]json.RawMessage, 0, len(entries))
 		for _, entry := range entries {
-			if friend.Allows(modelEntryID(entry)) {
+			if friend.listedModelAllowed(modelEntryID(entry)) {
 				kept = append(kept, entry)
 			}
 		}

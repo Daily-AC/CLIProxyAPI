@@ -18,6 +18,7 @@ import (
 
 	claudemodels "github.com/router-for-me/CLIProxyAPI/v8/internal/client/claude/models"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,6 +41,8 @@ type Friend struct {
 	Name string
 	// Models holds the model patterns as written in friends.yaml.
 	Models []string
+	// Channels holds the openai-compatibility channel names as written in friends.yaml.
+	Channels []string
 	// ExpiresRaw is the configured expiry text; empty means the key never expires.
 	ExpiresRaw string
 	// ExpiresAt is the first instant at which the key is no longer valid.
@@ -48,6 +51,8 @@ type Friend struct {
 
 	key      string
 	patterns []string
+	// providers holds the registry provider keys of Channels.
+	providers map[string]struct{}
 }
 
 // inactiveReason returns a non-empty message when the key must be rejected with 401.
@@ -61,14 +66,13 @@ func (f *Friend) inactiveReason(now time.Time) string {
 	return ""
 }
 
-// Allows reports whether the friend may call the requested model.
-func (f *Friend) Allows(requestedModel string) bool {
-	model := NormalizeModel(requestedModel)
-	if model == "" {
+// matchesPattern reports whether a normalized model name matches one of the patterns.
+func (f *Friend) matchesPattern(normalized string) bool {
+	if normalized == "" {
 		return false
 	}
 	for _, pattern := range f.patterns {
-		if globMatch(pattern, model) {
+		if globMatch(pattern, normalized) {
 			return true
 		}
 	}
@@ -108,6 +112,29 @@ func (s *FriendSet) ByName(name string) *Friend {
 		return nil
 	}
 	return s.byName[name]
+}
+
+// withoutKeys returns a copy without the friends whose key is in keys, plus the names
+// of the dropped friends.
+func (s *FriendSet) withoutKeys(keys []string) (*FriendSet, []string) {
+	blocked := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if trimmed := strings.TrimSpace(key); trimmed != "" {
+			blocked[trimmed] = struct{}{}
+		}
+	}
+	out := emptyFriendSet()
+	var dropped []string
+	for _, friend := range s.Friends() {
+		if _, isBlocked := blocked[friend.key]; isBlocked {
+			dropped = append(dropped, friend.Name)
+			continue
+		}
+		out.list = append(out.list, friend)
+		out.byKey[friend.key] = friend
+		out.byName[friend.Name] = friend
+	}
+	return out, dropped
 }
 
 // match returns the first credential of the request that is a friend key, using the
@@ -166,32 +193,27 @@ func extractBearerToken(header string) string {
 }
 
 type friendEntry struct {
-	Name    string   `yaml:"name"`
-	Key     string   `yaml:"key"`
-	Models  []string `yaml:"models"`
-	Expires string   `yaml:"expires"`
-	Enabled *bool    `yaml:"enabled"`
+	Name     string   `yaml:"name"`
+	Key      string   `yaml:"key"`
+	Models   []string `yaml:"models"`
+	Channels []string `yaml:"channels"`
+	Expires  string   `yaml:"expires"`
+	Enabled  *bool    `yaml:"enabled"`
 }
 
 type friendsDocument struct {
 	Keys []friendEntry `yaml:"keys"`
 }
 
-// ParseFriends parses and validates friends.yaml content. ownerKeys are the owner API
-// keys; a friend key equal to one of them is rejected. Error messages never contain keys.
-func ParseFriends(data []byte, ownerKeys []string) (*FriendSet, error) {
+// ParseFriends parses and validates friends.yaml content. Error messages never contain
+// keys. Collisions with owner API keys are handled by the runtime, which drops only the
+// colliding entries.
+func ParseFriends(data []byte) (*FriendSet, error) {
 	var doc friendsDocument
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if errDecode := decoder.Decode(&doc); errDecode != nil && !errors.Is(errDecode, io.EOF) {
 		return nil, fmt.Errorf("parse %s: %s", FriendsFileName, redactYAMLError(errDecode))
-	}
-
-	owners := make(map[string]struct{}, len(ownerKeys))
-	for _, key := range ownerKeys {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			owners[trimmed] = struct{}{}
-		}
 	}
 
 	set := emptyFriendSet()
@@ -227,11 +249,25 @@ func ParseFriends(data []byte, ownerKeys []string) (*FriendSet, error) {
 			problems = append(problems, fmt.Sprintf("%s: key duplicates the key of %s", label, other.Name))
 			continue
 		}
-		if _, isOwner := owners[key]; isOwner {
-			problems = append(problems, label+": key equals an owner api key")
+		friend := &Friend{Name: name, key: key, Enabled: entry.Enabled == nil || *entry.Enabled, providers: map[string]struct{}{}}
+		if len(entry.Channels) == 0 {
+			problems = append(problems, label+": channels is required (openai-compatibility names this key may use)")
 			continue
 		}
-		friend := &Friend{Name: name, key: key, Enabled: entry.Enabled == nil || *entry.Enabled}
+		channelsOK := true
+		for _, channel := range entry.Channels {
+			channel = strings.TrimSpace(channel)
+			if channel == "" {
+				problems = append(problems, label+": empty channel name")
+				channelsOK = false
+				break
+			}
+			friend.Channels = append(friend.Channels, channel)
+			friend.providers[channelProviderKey(channel)] = struct{}{}
+		}
+		if !channelsOK {
+			continue
+		}
 		modelsOK := true
 		for _, model := range entry.Models {
 			pattern := strings.ToLower(strings.TrimSpace(model))
@@ -265,6 +301,12 @@ func ParseFriends(data []byte, ownerKeys []string) (*FriendSet, error) {
 	return set, nil
 }
 
+// channelProviderKey maps an openai-compatibility channel name to the provider key under
+// which upstream registers its models and schedules its credentials.
+func channelProviderKey(channel string) string {
+	return util.OpenAICompatibleProviderKey(channel)
+}
+
 // parseExpiry accepts a date (valid through the end of that day in UTC+8) or RFC3339.
 func parseExpiry(raw string) (time.Time, error) {
 	if day, errDate := time.ParseInLocation("2006-01-02", raw, usageZone); errDate == nil {
@@ -284,10 +326,10 @@ func redactYAMLError(err error) string {
 }
 
 // NormalizeModel turns a requested or listed model name into the form matched against
-// friend patterns. It mirrors upstream routing: surrounding spaces are trimmed, a leading
-// "models/" is removed, Claude list-cloaked IDs (claude-fable-5-dd-<reversed>) are decoded,
-// one thinking suffix "name(value)" is stripped, and the result is lowercased (the model
-// registry falls back to lowercase lookups).
+// friend patterns: surrounding spaces are trimmed, a leading "models/" is removed, Claude
+// list-cloaked IDs (claude-fable-5-dd-<reversed>) are decoded, one thinking suffix
+// "name(value)" is stripped, and the result is lowercased. Patterns only narrow names;
+// which channel serves a model is checked separately against the model registry.
 func NormalizeModel(model string) string {
 	model = strings.TrimSpace(model)
 	model = strings.TrimPrefix(model, "models/")

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 )
 
 const (
@@ -19,12 +21,20 @@ const testFriendsYAML = `keys:
   - name: alice
     key: ` + aliceKey + `
     models: ["deepseek-v4-*", "Cline-Pass/*"]
+    channels: ["DeepSeek", "cline-pass"]
     expires: 2026-12-31
   - name: bob
     key: ` + bobKey + `
     models: ["deepseek-v4-flash"]
+    channels: ["deepseek"]
     enabled: false
 `
+
+// Registry provider keys of the test channels (util.OpenAICompatibleProviderKey).
+const (
+	deepseekProvider  = "openai-compatible-deepseek"
+	clinePassProvider = "openai-compatible-cline-pass"
+)
 
 const testConfigYAML = `api-keys:
   - ` + ownerKey + `
@@ -76,6 +86,28 @@ func newTestRuntime(t *testing.T, configYAML, friendsYAML string, clock *fakeClo
 	rt := NewRuntime(opts)
 	t.Cleanup(rt.Close)
 	return rt
+}
+
+// registerTestModels registers models for provider in the global model registry.
+func registerTestModels(t *testing.T, provider string, models ...string) {
+	t.Helper()
+	clientID := t.Name() + "|" + provider
+	infos := make([]*registry.ModelInfo, 0, len(models))
+	for _, model := range models {
+		infos = append(infos, &registry.ModelInfo{ID: model, Object: "model", OwnedBy: provider})
+	}
+	registry.GetGlobalRegistry().RegisterClient(clientID, provider, infos)
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(clientID) })
+}
+
+// registerDefaultModels registers the friend channels and owner-only providers.
+func registerDefaultModels(t *testing.T) {
+	t.Helper()
+	registerTestModels(t, deepseekProvider, "deepseek-v4-flash", "deepseek-v4-pro")
+	registerTestModels(t, clinePassProvider, "cline-pass/anthropic/claude-sonnet-4-6")
+	registerTestModels(t, "claude", "claude-sonnet-4-6")
+	registerTestModels(t, "codex", "gpt-5.6")
+	registerTestModels(t, "gemini", "gemini-3-flash")
 }
 
 func testNow() time.Time {
