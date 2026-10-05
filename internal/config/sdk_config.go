@@ -94,6 +94,25 @@ type CodexClientConfig struct {
 type ClaudeCodeConfig struct {
 	// DisableCloakingModelList disables model ID cloaking in Anthropic model list responses.
 	DisableCloakingModelList bool `yaml:"disable-cloaking-model-list" json:"disable-cloaking-model-list"`
+
+	// ManualOAuth switches Claude logins to the manual flow the native Claude Code
+	// CLI uses on headless hosts: the authorization URL points at Anthropic's hosted
+	// callback instead of http://localhost:54545/callback, and the login is completed
+	// by pasting the "<code>#<state>" pair that page renders. Required when the
+	// browser used for authorization cannot reach this host on the callback port.
+	ManualOAuth bool `yaml:"manual-oauth" json:"manual-oauth"`
+
+	// ProxyURL routes the Claude Code OAuth flow through a dedicated proxy while
+	// leaving the global proxy-url alone, so hosts that only need Anthropic traffic
+	// tunnelled do not have to send every other provider through the same hop.
+	// Required when this host cannot reach Anthropic directly at all — a server in
+	// a region Anthropic refuses answers 403 on both platform.claude.com and
+	// api.anthropic.com — because the authorization code exchange happens before any
+	// credential exists and therefore cannot pick up a per-credential proxy-url.
+	// Credentials minted by the flow inherit this value, so their token refreshes and
+	// inference requests keep taking the same route; an explicit per-credential
+	// proxy-url (including "direct") still wins over it.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

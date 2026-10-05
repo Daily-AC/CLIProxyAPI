@@ -394,6 +394,27 @@ upstream:
     # When true, return original model IDs in Anthropic model list responses instead of cloaked IDs.
     disable-cloaking-model-list: false
 
+    # When true, Claude OAuth logins use the manual flow the native Claude Code CLI falls back to
+    # on headless hosts: the authorization URL points at https://platform.claude.com/oauth/code/callback
+    # instead of http://localhost:54545/callback, and the login is finished by submitting the
+    # "<code>#<state>" pair that page renders (paste it into the management panel's callback field,
+    # or into the --claude-login prompt). Turn this on when the browser used for authorization cannot
+    # reach this server on the callback port, e.g. a headless VPS driven from a laptop browser.
+    # The auth-url endpoints also accept a per-request override "manual=1|0":
+    # /v0/management/anthropic-auth-url?manual=1 or /v8/management/oauth/auth-url?provider=claude&manual=1
+    # Legacy spelling: claude-code.manual-oauth
+    manual-oauth: false
+
+    # Routes Claude Code OAuth traffic through a dedicated proxy without touching requests.proxy-url,
+    # so only Anthropic-bound requests take the detour while every other provider keeps its own route.
+    # Required when this host cannot reach Anthropic at all — a server in a region Anthropic refuses gets
+    # 403 "Request not allowed" on both platform.claude.com and api.anthropic.com — because the
+    # authorization code exchange runs before the credential exists and so cannot read a per-credential
+    # proxy-url. Credentials created by the flow inherit this value, keeping their token refreshes and
+    # inference requests on the same route; a per-credential proxy-url (including "direct") still wins.
+    # Legacy spelling: claude-code.proxy-url
+    # proxy-url: "http://127.0.0.1:32450"
+
     # Anthropic-Beta is assembled per request rather than sent as a fixed list, matching
     # Claude Code: context-1m sits right after claude-code, mid-conversation-system
     # is added only for models that accept a role=system turn, advanced-tool-use only when
