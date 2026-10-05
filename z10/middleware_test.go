@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -57,9 +58,11 @@ type testEngine struct {
 
 // newMiddlewareEngine mirrors the upstream layout: the friend middleware is global and
 // runs before the route-group auth middleware, and handlers read bodies like upstream.
-func newMiddlewareEngine(t *testing.T, rt *Runtime) *testEngine {
+// extra handlers run between the friend middleware and the route auth middleware.
+func newMiddlewareEngine(t *testing.T, rt *Runtime, extra ...gin.HandlerFunc) *testEngine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
+	registerDefaultModels(t)
 	manager := sdkaccess.NewManager()
 	manager.SetProviders([]sdkaccess.Provider{ownerProvider(t), &accessProvider{rt: rt}})
 	te := &testEngine{engine: gin.New()}
@@ -101,6 +104,7 @@ func newMiddlewareEngine(t *testing.T, rt *Runtime) *testEngine {
 
 	engine := te.engine
 	engine.Use(rt.Middleware())
+	engine.Use(extra...)
 	v1 := engine.Group("/v1", auth)
 	v1.GET("/models", list)
 	v1.GET("/models/*model", detail)
@@ -254,12 +258,15 @@ func TestMiddlewareDeniesUnlistedModels(t *testing.T) {
 		{"/v1/messages", "claude-fable-5-dd-" + reverse("gemini-3-flash")},
 		{"/v1/messages/count_tokens", "claude-sonnet-4-6"},
 		{"/v1/completions", "gpt-5.6"},
+		{"/v1/chat/completions", "deepseek-v4-1-flash"},
+		{"/v1/chat/completions", "models/deepseek-v4-flash"},
+		{"/v1/chat/completions", cloakedDeepSeek},
 	} {
 		recorder := te.do(request{method: http.MethodPost, path: tc.path, body: chatBody(tc.model), headers: bearer(aliceKey)})
 		if recorder.Code != http.StatusForbidden || errorCode(recorder) != "model_not_allowed" {
 			t.Fatalf("%s %s: status=%d body=%s", tc.path, tc.model, recorder.Code, recorder.Body.String())
 		}
-		if !strings.Contains(recorder.Body.String(), tc.model) {
+		if body := recorder.Body.String(); !strings.Contains(body, tc.model) && !strings.Contains(body, NormalizeModel(tc.model)) {
 			t.Fatalf("error must name the model: %s", recorder.Body.String())
 		}
 	}
@@ -284,18 +291,15 @@ func TestMiddlewareGeminiPathModels(t *testing.T) {
 		}
 	}
 	for path, code := range map[string]string{
-		"/v1beta/models/gemini-3-flash:generateContent":                          "model_not_allowed",
-		"/v1beta/models/claude-sonnet-4-6:streamGenerateContent?alt=sse":         "model_not_allowed",
-		"/v1beta/models/deepseek-v4-flash:embedContent":                          "endpoint_not_allowed",
-		"/v1beta/models/deepseek-v4-flash":                                       "endpoint_not_allowed",
-		"/v1beta/models/deepseek-v4-flash:generateContent:x":                     "endpoint_not_allowed",
-		"/v1beta/models/models%2Fgemini-3-flash:generateContent":                 "model_not_allowed",
-		"/v1beta/models/deepseek-v4-flash:generateContent?key=" + aliceKey + "x": "",
+		"/v1beta/models/gemini-3-flash:generateContent":                  "model_not_allowed",
+		"/v1beta/models/claude-sonnet-4-6:streamGenerateContent?alt=sse": "model_not_allowed",
+		"/v1beta/models/deepseek-v4-flash:embedContent":                  "endpoint_not_allowed",
+		"/v1beta/models/deepseek-v4-flash":                               "endpoint_not_allowed",
+		"/v1beta/models/deepseek-v4-flash:generateContent:x":             "endpoint_not_allowed",
+		"/v1beta/models/models%2Fgemini-3-flash:generateContent":         "model_not_allowed",
+		"/v1beta/models/models%2Fdeepseek-v4-flash:generateContent":      "model_not_allowed",
 	} {
 		recorder := te.do(request{method: http.MethodPost, path: path, body: body, headers: map[string]string{"X-Goog-Api-Key": aliceKey}})
-		if code == "" {
-			continue
-		}
 		if recorder.Code != http.StatusForbidden || errorCode(recorder) != code {
 			t.Fatalf("%s: status=%d body=%s", path, recorder.Code, recorder.Body.String())
 		}
@@ -351,53 +355,189 @@ func zstdSkippableFrame(payload []byte) []byte {
 	return append(frame, payload...)
 }
 
-func TestMiddlewareCompressedBodies(t *testing.T) {
+func TestMiddlewareContentEncodings(t *testing.T) {
 	rt := newTestRuntime(t, testConfigYAML, testFriendsYAML, newFakeClock(testNow()))
 	te := newMiddlewareEngine(t, rt)
 
 	allowed := zstdCompress(t, chatBody("deepseek-v4-flash"))
-	recorder := te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: allowed, encoding: "zstd", headers: bearer(aliceKey)})
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("zstd allowed: %d %s", recorder.Code, recorder.Body.String())
+	for _, encoding := range []string{"zstd", "ZSTD", " zstd "} {
+		recorder := te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: allowed, encoding: encoding, headers: bearer(aliceKey)})
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("zstd %q allowed: %d %s", encoding, recorder.Code, recorder.Body.String())
+		}
+		if echo := decodeEcho(t, recorder); echo.Model != "deepseek-v4-flash" || echo.BodySHA != sha(allowed) {
+			t.Fatalf("zstd body not passed through unchanged: %+v", echo)
+		}
 	}
-	if echo := decodeEcho(t, recorder); echo.Model != "deepseek-v4-flash" || echo.BodySHA != sha(allowed) {
-		t.Fatalf("zstd body not passed through unchanged: %+v", echo)
-	}
-
-	forbidden := zstdCompress(t, chatBody("claude-sonnet-4-6"))
-	if recorder = te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: forbidden, encoding: "zstd", headers: bearer(aliceKey)}); recorder.Code != http.StatusForbidden {
+	if recorder := te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: zstdCompress(t, chatBody("claude-sonnet-4-6")), encoding: "zstd", headers: bearer(aliceKey)}); recorder.Code != http.StatusForbidden {
 		t.Fatalf("zstd forbidden: %d %s", recorder.Code, recorder.Body.String())
 	}
-
-	gzipForbidden := gzipCompress(t, chatBody("claude-sonnet-4-6"))
-	if recorder = te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: gzipForbidden, encoding: "gzip", headers: bearer(aliceKey)}); recorder.Code != http.StatusForbidden {
-		t.Fatalf("gzip forbidden: %d %s", recorder.Code, recorder.Body.String())
-	}
-	// Upstream handlers do not decode gzip; an allowed gzip body passes the check and
-	// fails downstream exactly as it would without friend keys.
-	gzipAllowed := gzipCompress(t, chatBody("deepseek-v4-flash"))
-	if recorder = te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: gzipAllowed, encoding: "gzip", headers: bearer(aliceKey)}); recorder.Code != http.StatusBadRequest || te.calls == 0 {
-		t.Fatalf("gzip allowed: %d %s", recorder.Code, recorder.Body.String())
+	if recorder := te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: []byte("not zstd"), encoding: "zstd", headers: bearer(aliceKey)}); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid zstd: %d %s", recorder.Code, recorder.Body.String())
 	}
 
-	// Smuggling: a skippable frame carries a forbidden model that the Claude handler
-	// (which parses raw bytes) would route on, while the decoded body looks allowed.
+	// Smuggling: a zstd skippable frame carries a forbidden model. The Claude handler
+	// parses raw bytes and would route on it (owner fixture below), so encodings a
+	// handler does not decode itself are refused for friend keys.
 	smuggled := append(zstdSkippableFrame(chatBody("claude-sonnet-4-6")), allowed...)
 	ownerView := te.do(request{method: http.MethodPost, path: "/v1/messages", body: smuggled, encoding: "zstd", headers: bearer(ownerKey)})
 	if ownerView.Code != http.StatusOK || decodeEcho(t, ownerView).Model != "claude-sonnet-4-6" {
 		t.Fatalf("fixture must route to the smuggled model downstream: %d %s", ownerView.Code, ownerView.Body.String())
 	}
-	if recorder = te.do(request{method: http.MethodPost, path: "/v1/messages", body: smuggled, encoding: "zstd", headers: bearer(aliceKey)}); recorder.Code != http.StatusForbidden {
-		t.Fatalf("smuggled zstd model: %d %s", recorder.Code, recorder.Body.String())
+	for _, req := range []request{
+		{path: "/v1/messages", body: smuggled, encoding: "zstd"},
+		{path: "/v1beta/models/deepseek-v4-flash:generateContent", body: allowed, encoding: "zstd"},
+		{path: "/v1/chat/completions", body: gzipCompress(t, chatBody("deepseek-v4-flash")), encoding: "gzip"},
+		{path: "/v1/messages", body: gzipCompress(t, chatBody("claude-sonnet-4-6")), encoding: "gzip"},
+		{path: "/v1/chat/completions", body: zstdCompress(t, allowed), encoding: "zstd, zstd"},
+		{path: "/v1/chat/completions", body: allowed, encoding: "identity, zstd"},
+	} {
+		req.method = http.MethodPost
+		req.headers = bearer(aliceKey)
+		if recorder := te.do(req); recorder.Code != http.StatusUnsupportedMediaType || errorCode(recorder) != "unsupported_content_encoding" {
+			t.Fatalf("%s %q: %d %s", req.path, req.encoding, recorder.Code, recorder.Body.String())
+		}
 	}
+	// Two Content-Encoding header lines: upstream reads the first, refuse the ambiguity.
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody("deepseek-v4-flash")))
+	httpReq.Header.Set("Authorization", "Bearer "+aliceKey)
+	httpReq.Header.Add("Content-Encoding", "identity")
+	httpReq.Header.Add("Content-Encoding", "zstd")
+	recorder := httptest.NewRecorder()
+	te.engine.ServeHTTP(recorder, httpReq)
+	if recorder.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("two Content-Encoding headers: %d", recorder.Code)
+	}
+}
 
-	duplicate := []byte(`{"model":"deepseek-v4-flash","model":"claude-sonnet-4-6","messages":[]}`)
-	if recorder = te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: duplicate, headers: bearer(aliceKey)}); recorder.Code != http.StatusForbidden {
-		t.Fatalf("duplicate model keys: %d %s", recorder.Code, recorder.Body.String())
+func TestMiddlewareStrictJSONBodies(t *testing.T) {
+	rt := newTestRuntime(t, testConfigYAML, testFriendsYAML, newFakeClock(testNow()))
+	te := newMiddlewareEngine(t, rt)
+	messages := `"messages":[{"role":"user","content":"hi"}]`
+	for name, tc := range map[string]struct {
+		body []byte
+		code string
+	}{
+		"duplicate model":      {[]byte(`{"model":"deepseek-v4-flash","model":"claude-sonnet-4-6",` + messages + `}`), "duplicate_model"},
+		"escaped duplicate":    {[]byte(`{"model":"deepseek-v4-flash","mod\u0065l":"claude-sonnet-4-6",` + messages + `}`), "duplicate_model"},
+		"case variants":        {[]byte(`{"model":"deepseek-v4-flash","Model":"claude-sonnet-4-6","MODEL":"gpt-5.6",` + messages + `}`), "duplicate_model"},
+		"escaped case variant": {[]byte(`{"model":"deepseek-v4-flash","\u004dodel":"claude-sonnet-4-6",` + messages + `}`), "duplicate_model"},
+		"BOM prefix duplicate": {append([]byte("\xEF\xBB\xBF"), []byte(`{"model":"deepseek-v4-flash","model":"claude-sonnet-4-6",`+messages+`}`)...), "invalid_json"},
+		"BOM prefix":           {append([]byte("\xEF\xBB\xBF"), chatBody("deepseek-v4-flash")...), "invalid_json"},
+		"garbage prefix":       {[]byte(`x{"model":"deepseek-v4-flash","model":"claude-sonnet-4-6",` + messages + `}`), "invalid_json"},
+		"two objects":          {append(chatBody("deepseek-v4-flash"), chatBody("claude-sonnet-4-6")...), "invalid_json"},
+		"array body":           {[]byte(`[{"model":"deepseek-v4-flash"}]`), "invalid_json"},
+		"string body":          {[]byte(`"deepseek-v4-flash"`), "invalid_json"},
+		"only capitalized key": {[]byte(`{"Model":"deepseek-v4-flash",` + messages + `}`), "invalid_model"},
+		"non-string model":     {[]byte(`{"model":["deepseek-v4-flash"],` + messages + `}`), "invalid_model"},
+		"missing model":        {[]byte(`{` + messages + `}`), "model_required"},
+		"empty body":           {[]byte(``), "invalid_json"},
+	} {
+		recorder := te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: tc.body, headers: bearer(aliceKey)})
+		if recorder.Code != http.StatusBadRequest || errorCode(recorder) != tc.code {
+			t.Fatalf("%s: %d %s", name, recorder.Code, recorder.Body.String())
+		}
 	}
-	escaped := []byte(`{"model":"deepseek-v4-flash","model":"claude-sonnet-4-6","messages":[]}`)
-	if recorder = te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: escaped, headers: bearer(aliceKey)}); recorder.Code != http.StatusForbidden {
-		t.Fatalf("escaped duplicate model key: %d %s", recorder.Code, recorder.Body.String())
+	if te.calls != 0 {
+		t.Fatalf("rejected bodies reached handlers %d times", te.calls)
+	}
+	// Leading and trailing JSON whitespace is fine.
+	if recorder := te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: append(append([]byte(" \n"), chatBody("deepseek-v4-flash")...), '\n'), headers: bearer(aliceKey)}); recorder.Code != http.StatusOK {
+		t.Fatalf("whitespace around body: %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestMiddlewareBodySizeCaps(t *testing.T) {
+	previous := maxFriendBodyBytes
+	maxFriendBodyBytes = 1 << 20
+	t.Cleanup(func() { maxFriendBodyBytes = previous })
+	rt := newTestRuntime(t, testConfigYAML, testFriendsYAML, newFakeClock(testNow()))
+	te := newMiddlewareEngine(t, rt)
+
+	large := []byte(`{"model":"deepseek-v4-flash","pad":"` + strings.Repeat("0", 2<<20) + `"}`)
+	bomb := zstdCompress(t, large)
+	if len(bomb) >= 1<<20 {
+		t.Fatalf("fixture must compress below the cap: %d", len(bomb))
+	}
+	for name, req := range map[string]request{
+		"raw":  {body: large},
+		"zstd": {body: bomb, encoding: "zstd"},
+	} {
+		req.method, req.path = http.MethodPost, "/v1/chat/completions"
+		req.headers = bearer(aliceKey)
+		if recorder := te.do(req); recorder.Code != http.StatusRequestEntityTooLarge || errorCode(recorder) != "body_too_large" {
+			t.Fatalf("%s: %d %s", name, recorder.Code, recorder.Body.String())
+		}
+		// Owner requests are not capped.
+		req.headers = bearer(ownerKey)
+		if recorder := te.do(req); recorder.Code != http.StatusOK {
+			t.Fatalf("owner %s: %d", name, recorder.Code)
+		}
+	}
+}
+
+func TestAccessProviderRequiresMiddlewareMarker(t *testing.T) {
+	rt := newTestRuntime(t, testConfigYAML, testFriendsYAML, newFakeClock(testNow()))
+	provider := &accessProvider{rt: rt}
+	alice := rt.Friends().ByName("alice")
+
+	req := httptestRequestWithKey(aliceKey)
+	if _, authErr := provider.Authenticate(req.Context(), req); authErr == nil || authErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no marker: %+v", authErr)
+	}
+	impostor := *alice
+	impostor.Name = "mallory"
+	wrong := req.WithContext(withFriendMarker(req.Context(), &impostor))
+	if _, authErr := provider.Authenticate(wrong.Context(), wrong); authErr == nil {
+		t.Fatal("marker for another friend must be rejected")
+	}
+	marked := req.WithContext(withFriendMarker(req.Context(), alice))
+	result, authErr := provider.Authenticate(marked.Context(), marked)
+	if authErr != nil || result.Principal != "friend:alice" {
+		t.Fatalf("marked request: %+v %+v", result, authErr)
+	}
+}
+
+// A key that becomes a friend key between the middleware check and authentication must
+// not be authenticated as an unrestricted friend.
+func TestReloadBetweenMiddlewareAndAuthFailsClosed(t *testing.T) {
+	const daveKey = "sk-z10-dave-0123456789abcdef"
+	rt := newTestRuntime(t, testConfigYAML, testFriendsYAML, newFakeClock(testNow()))
+	friendsPath := filepath.Join(filepath.Dir(rt.configPath), FriendsFileName)
+	reloadMidRequest := func(c *gin.Context) {
+		writeTestFile(t, friendsPath, testFriendsYAML+"  - name: dave\n    key: "+daveKey+"\n    models: [\"*\"]\n    channels: [deepseek]\n")
+		if errReload := rt.Reload(); errReload != nil {
+			t.Errorf("reload: %v", errReload)
+		}
+		c.Next()
+	}
+	te := newMiddlewareEngine(t, rt, reloadMidRequest)
+	recorder := te.do(request{method: http.MethodPost, path: "/v1/images/generations", body: chatBody("gpt-image-2"), headers: bearer(daveKey)})
+	if recorder.Code != http.StatusUnauthorized || te.calls != 0 {
+		t.Fatalf("key added mid-request: %d %s", recorder.Code, recorder.Body.String())
+	}
+	// The next request is checked by the middleware as dave.
+	if recorder = te.do(request{method: http.MethodPost, path: "/v1/images/generations", body: chatBody("gpt-image-2"), headers: bearer(daveKey)}); recorder.Code != http.StatusForbidden {
+		t.Fatalf("dave after reload: %d", recorder.Code)
+	}
+}
+
+// Rejected requests must not create usage buckets (friend-controlled names).
+func TestRejectedRequestsDoNotGrowUsage(t *testing.T) {
+	rt := newTestRuntime(t, testConfigYAML, testFriendsYAML, newFakeClock(testNow()))
+	te := newMiddlewareEngine(t, rt)
+	long := strings.Repeat("a", 64<<10)
+	for i := range 50 {
+		model := "deepseek-v4-" + strconv.Itoa(i) + "-" + long
+		if recorder := te.do(request{method: http.MethodPost, path: "/v1/chat/completions", body: chatBody(model), headers: bearer(aliceKey)}); recorder.Code != http.StatusForbidden {
+			t.Fatalf("unregistered model: %d", recorder.Code)
+		}
+	}
+	if usage := rt.Usage().Report().Friends["alice"]; usage != nil {
+		t.Fatalf("rejected requests created usage: %d model buckets", len(usage.Models))
+	}
+	if te.calls != 0 {
+		t.Fatalf("rejected requests reached handlers %d times", te.calls)
 	}
 }
 

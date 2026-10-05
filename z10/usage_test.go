@@ -2,6 +2,7 @@ package z10
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -108,5 +109,33 @@ func TestUsageFlushOnEveryChange(t *testing.T) {
 	}
 	if reloaded.Report().Friends["alice"].Requests != 1 {
 		t.Fatal("change was not written synchronously")
+	}
+}
+
+func TestUsageBucketCaps(t *testing.T) {
+	clock := newFakeClock(testNow())
+	store := NewUsageStore(filepath.Join(t.TempDir(), UsageFileName), clock.Now, time.Hour)
+	for i := range maxModelBuckets + 50 {
+		store.RecordRequest("alice", fmt.Sprintf("model-%03d", i), false)
+	}
+	store.RecordRequest("alice", "model-000", false)
+	models := store.Report().Friends["alice"].Models
+	if len(models) != maxModelBuckets+1 || models[otherModelBucket].Requests != 50 || models["model-000"].Requests != 2 {
+		t.Fatalf("model buckets = %d, other = %+v", len(models), models[otherModelBucket])
+	}
+
+	for day := range maxDayBuckets + 30 {
+		clock.Set(testNow().AddDate(0, 0, day))
+		store.RecordTokens("alice", "model-000", coreusage.Detail{InputTokens: 1})
+	}
+	days := store.Report().Friends["alice"].Days
+	if len(days) != maxDayBuckets {
+		t.Fatalf("day buckets = %d", len(days))
+	}
+	if _, oldest := days[testNow().In(usageZone).Format("2006-01-02")]; oldest {
+		t.Fatal("oldest day must be dropped")
+	}
+	if _, newest := days[clock.Now().In(usageZone).Format("2006-01-02")]; !newest {
+		t.Fatal("newest day must be kept")
 	}
 }

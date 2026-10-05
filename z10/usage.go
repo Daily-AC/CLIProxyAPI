@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,15 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-const usageFileVersion = 1
+const (
+	usageFileVersion = 1
+	// maxModelBuckets caps distinct per-friend model buckets; further models share
+	// otherModelBucket.
+	maxModelBuckets  = 200
+	otherModelBucket = "_other"
+	// maxDayBuckets keeps this many most recent days per friend.
+	maxDayBuckets = 400
+)
 
 // Counters is one usage bucket.
 type Counters struct {
@@ -159,11 +168,9 @@ func (s *UsageStore) update(name, model string, used bool, apply func(*Counters)
 	}
 	if apply != nil {
 		apply(&entry.Counters)
-		if model == "" {
-			model = "unknown"
-		}
-		apply(bucket(entry.Models, model))
+		apply(bucket(entry.Models, modelBucketKey(entry.Models, model)))
 		apply(bucket(entry.Days, now.In(usageZone).Format("2006-01-02")))
+		trimDays(entry.Days)
 	}
 	s.updatedAt = now
 	s.dirty = true
@@ -176,6 +183,40 @@ func (s *UsageStore) update(name, model string, used bool, apply func(*Counters)
 		if errFlush := s.Flush(); errFlush != nil {
 			log.WithError(errFlush).Error("z10: failed to flush friend usage")
 		}
+	}
+}
+
+// modelBucketKey returns the bucket for model, folding new models into otherModelBucket
+// once maxModelBuckets distinct models exist.
+func modelBucketKey(models map[string]*Counters, model string) string {
+	if model == "" {
+		model = "unknown"
+	}
+	if _, exists := models[model]; exists {
+		return model
+	}
+	distinct := len(models)
+	if _, hasOther := models[otherModelBucket]; hasOther {
+		distinct--
+	}
+	if distinct >= maxModelBuckets {
+		return otherModelBucket
+	}
+	return model
+}
+
+// trimDays drops the oldest day buckets beyond maxDayBuckets (keys are YYYY-MM-DD).
+func trimDays(days map[string]*Counters) {
+	if len(days) <= maxDayBuckets {
+		return
+	}
+	keys := make([]string, 0, len(days))
+	for key := range days {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys[:len(keys)-maxDayBuckets] {
+		delete(days, key)
 	}
 }
 

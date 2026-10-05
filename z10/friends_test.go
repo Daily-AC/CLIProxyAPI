@@ -15,11 +15,12 @@ func reverse(s string) string {
 }
 
 func TestParseFriends(t *testing.T) {
-	set, err := ParseFriends([]byte(testFriendsYAML+`  - name: carol
+	set, err := ParseFriends([]byte(testFriendsYAML + `  - name: carol
     key: sk-z10-carol-0123456789abcdef
     models: ["deepseek-v4-flash"]
+    channels: ["deepseek"]
     expires: "2026-10-06T12:00:00Z"
-`), []string{ownerKey})
+`))
 	if err != nil {
 		t.Fatalf("ParseFriends: %v", err)
 	}
@@ -37,6 +38,12 @@ func TestParseFriends(t *testing.T) {
 	if got := strings.Join(alice.Models, ","); got != "deepseek-v4-*,Cline-Pass/*" {
 		t.Fatalf("alice models = %s", got)
 	}
+	if _, ok := alice.providers[deepseekProvider]; !ok || len(alice.providers) != 2 || strings.Join(alice.Channels, ",") != "DeepSeek,cline-pass" {
+		t.Fatalf("alice channels = %v providers = %v", alice.Channels, alice.providers)
+	}
+	if _, ok := alice.providers[clinePassProvider]; !ok {
+		t.Fatalf("alice providers = %v", alice.providers)
+	}
 	if set.ByName("bob").Enabled {
 		t.Fatal("bob must be disabled")
 	}
@@ -44,7 +51,7 @@ func TestParseFriends(t *testing.T) {
 		t.Fatalf("carol expiry = %v, want %v", set.ByName("carol").ExpiresAt, want)
 	}
 
-	empty, errEmpty := ParseFriends(nil, nil)
+	empty, errEmpty := ParseFriends(nil)
 	if errEmpty != nil || empty.Len() != 0 {
 		t.Fatalf("empty file: %v %d", errEmpty, empty.Len())
 	}
@@ -52,7 +59,7 @@ func TestParseFriends(t *testing.T) {
 
 func TestParseFriendsValidation(t *testing.T) {
 	entry := func(name, key, extra string) string {
-		return "  - name: " + name + "\n    key: " + key + "\n    models: [\"deepseek-v4-*\"]\n" + extra
+		return "  - name: " + name + "\n    key: " + key + "\n    models: [\"deepseek-v4-*\"]\n    channels: [deepseek]\n" + extra
 	}
 	cases := []struct {
 		name string
@@ -64,17 +71,18 @@ func TestParseFriendsValidation(t *testing.T) {
 		{"empty key", "keys:\n" + entry("alice", `""`, ""), "key is empty"},
 		{"short key", "keys:\n" + entry("alice", "short", ""), "at least 16"},
 		{"whitespace key", "keys:\n" + entry("alice", `"sk-z10 alice 0123456789"`, ""), "whitespace"},
-		{"owner key", "keys:\n" + entry("alice", ownerKey, ""), "equals an owner api key"},
+		{"missing channels", "keys:\n  - name: alice\n    key: " + aliceKey + "\n    models: [\"x\"]\n", "channels is required"},
+		{"empty channel", "keys:\n  - name: alice\n    key: " + aliceKey + "\n    models: [\"x\"]\n    channels: [\" \"]\n", "empty channel name"},
 		{"bad name", "keys:\n" + entry("al ice", aliceKey, ""), "name must match"},
 		{"empty name", "keys:\n" + entry(`""`, aliceKey, ""), "name must match"},
 		{"bad expiry", "keys:\n" + entry("alice", aliceKey, "    expires: next-week\n"), "must be YYYY-MM-DD or RFC3339"},
-		{"empty pattern", "keys:\n  - name: alice\n    key: " + aliceKey + "\n    models: [\"\"]\n", "empty model pattern"},
+		{"empty pattern", "keys:\n  - name: alice\n    key: " + aliceKey + "\n    models: [\"\"]\n    channels: [deepseek]\n", "empty model pattern"},
 		{"unknown field", "keys:\n" + entry("alice", aliceKey, "    enabeld: false\n"), "enabeld"},
 		{"type error", "keys:\n  - name: alice\n    key: " + aliceKey + "\n    enabled: " + bobKey + "\n", "parse"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := ParseFriends([]byte(tc.yaml), []string{ownerKey})
+			_, err := ParseFriends([]byte(tc.yaml))
 			if err == nil {
 				t.Fatalf("expected error containing %q", tc.want)
 			}
@@ -91,7 +99,7 @@ func TestParseFriendsValidation(t *testing.T) {
 }
 
 func TestFriendExpiryAndEnabled(t *testing.T) {
-	set, err := ParseFriends([]byte(testFriendsYAML), nil)
+	set, err := ParseFriends([]byte(testFriendsYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,20 +162,53 @@ func TestGlobMatch(t *testing.T) {
 	}
 }
 
-func TestFriendAllows(t *testing.T) {
-	set, err := ParseFriends([]byte(testFriendsYAML), nil)
+func TestCheckModelUsesRegistryChannels(t *testing.T) {
+	registerDefaultModels(t)
+	registerTestModels(t, "openai-compatible-subscription", "deepseek-v4-1-flash")
+	set, err := ParseFriends([]byte(testFriendsYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
 	alice := set.ByName("alice")
-	for _, model := range []string{"deepseek-v4-flash", "DEEPSEEK-V4-PRO(high)", "cline-pass/anthropic/claude-sonnet-4-6", "claude-fable-5-dd-" + reverse("deepseek-v4-flash")} {
-		if !alice.Allows(model) {
-			t.Errorf("alice must be allowed %q", model)
+	for _, model := range []string{"deepseek-v4-flash", "DEEPSEEK-V4-PRO(high)", "deepseek-v4-pro(8192)", "cline-pass/anthropic/claude-sonnet-4-6"} {
+		if gateErr := alice.checkModel(model); gateErr != nil {
+			t.Errorf("alice must be allowed %q: %v", model, gateErr)
 		}
 	}
-	for _, model := range []string{"claude-sonnet-4-6", "gemini-3-flash", "gpt-5.6", "", "auto", "xdeepseek-v4-flash", "claude-fable-5-dd-" + reverse("gemini-3-flash")} {
-		if alice.Allows(model) {
-			t.Errorf("alice must not be allowed %q", model)
+	for model, reason := range map[string]string{
+		"claude-sonnet-4-6":        "not allowed",
+		"gemini-3-flash":           "not allowed",
+		"xdeepseek-v4-flash":       "not allowed",
+		"":                         "not allowed",
+		"deepseek-v4-unknown":      "not available",
+		"deepseek-v4-1-flash":      "channel this API key cannot use",
+		"auto":                     "not allowed",
+		"models/deepseek-v4-flash": "not available",
+		"claude-fable-5-dd-" + reverse("deepseek-v4-flash"): "not available",
+	} {
+		gateErr := alice.checkModel(model)
+		if gateErr == nil || !strings.Contains(gateErr.message, reason) {
+			t.Errorf("alice %q: %v, want %q", model, gateErr, reason)
 		}
+	}
+	// A list entry is shown in the form its handler decodes.
+	for id, want := range map[string]bool{
+		"models/deepseek-v4-flash":                          true,
+		"claude-fable-5-dd-" + reverse("deepseek-v4-flash"): true,
+		"claude-sonnet-4-6":                                 false,
+		"deepseek-v4-1-flash":                               false,
+	} {
+		if got := alice.listedModelAllowed(id); got != want {
+			t.Errorf("listedModelAllowed(%q) = %v, want %v", id, got, want)
+		}
+	}
+
+	// A second channel registering an allowed name takes the model away (fail closed).
+	registerTestModels(t, "openai-compatible-subscription-2", "deepseek-v4-flash")
+	if gateErr := alice.checkModel("deepseek-v4-flash"); gateErr == nil || gateErr.code != "model_not_allowed" {
+		t.Fatalf("shared model name must be denied: %v", gateErr)
+	}
+	if gateErr := alice.checkModel("DeepSeek-V4-Flash(high)"); gateErr == nil {
+		t.Fatal("case and suffix variants must resolve like the router")
 	}
 }

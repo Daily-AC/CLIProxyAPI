@@ -11,6 +11,7 @@ import (
 type friendView struct {
 	Name     string     `json:"name"`
 	Models   []string   `json:"models"`
+	Channels []string   `json:"channels"`
 	Expires  string     `json:"expires,omitempty"`
 	Enabled  bool       `json:"enabled"`
 	Active   bool       `json:"active"`
@@ -47,11 +48,12 @@ func (rt *Runtime) handleFriends(c *gin.Context) {
 	views := make([]friendView, 0, len(friends))
 	for _, friend := range friends {
 		view := friendView{
-			Name:    friend.Name,
-			Models:  append([]string{}, friend.Models...),
-			Expires: friend.ExpiresRaw,
-			Enabled: friend.Enabled,
-			Active:  friend.inactiveReason(now) == "",
+			Name:     friend.Name,
+			Models:   append([]string{}, friend.Models...),
+			Channels: append([]string{}, friend.Channels...),
+			Expires:  friend.ExpiresRaw,
+			Enabled:  friend.Enabled,
+			Active:   friend.inactiveReason(now) == "",
 		}
 		if usage := report.Friends[friend.Name]; usage != nil {
 			view.LastUsed = usage.LastUsed
