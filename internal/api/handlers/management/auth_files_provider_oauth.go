@@ -20,6 +20,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/kimi"
 	metaauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/meta"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -33,6 +34,15 @@ type codexOAuthService interface {
 	ExchangeCodeForTokens(ctx context.Context, code string, pkceCodes *codex.PKCECodes) (*codex.CodexAuthBundle, error)
 	CreateTokenStorage(bundle *codex.CodexAuthBundle) *codex.CodexTokenStorage
 }
+
+type claudeOAuthService interface {
+	GenerateAuthURL(state string, pkceCodes *claude.PKCECodes) (string, string, error)
+	GenerateManualAuthURL(state string, pkceCodes *claude.PKCECodes) (string, string, error)
+	ExchangeCodeForTokensWithRedirect(ctx context.Context, code, state, redirectURI string, pkceCodes *claude.PKCECodes) (*claude.ClaudeAuthBundle, error)
+	CreateTokenStorage(bundle *claude.ClaudeAuthBundle) *claude.ClaudeTokenStorage
+}
+
+var newClaudeOAuthService = func(cfg *config.Config) claudeOAuthService { return claude.NewClaudeAuth(cfg) }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	ctx := context.Background()
@@ -57,10 +67,24 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	// Initialize Claude auth service
-	anthropicAuth := claude.NewClaudeAuth(h.cfg)
+	anthropicAuth := newClaudeOAuthService(h.cfg)
+
+	// Manual mode targets Anthropic's hosted callback instead of a local port, so
+	// the authorizing browser never has to reach this host. The user completes the
+	// login by submitting the "<code>#<state>" pair rendered on that page.
+	manual := h.anthropicManualOAuth(c)
+	redirectURI := claude.RedirectURI
+	if manual {
+		redirectURI = claude.ManualRedirectURI
+	}
 
 	// Generate authorization URL (then override redirect_uri to reuse server port)
-	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
+	var authURL string
+	if manual {
+		authURL, state, err = anthropicAuth.GenerateManualAuthURL(state, pkceCodes)
+	} else {
+		authURL, state, err = anthropicAuth.GenerateAuthURL(state, pkceCodes)
+	}
 	if err != nil {
 		log.Errorf("Failed to generate authorization URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
@@ -69,7 +93,9 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 	RegisterOAuthSession(state, "anthropic")
 
-	isWebUI := isWebUIRequest(c)
+	// The local callback forwarder only helps the local-redirect flow; the manual
+	// flow never redirects to this host.
+	isWebUI := isWebUIRequest(c) && !manual
 	var forwarder *callbackForwarder
 	if isWebUI {
 		targetURL, errTarget := h.managementCallbackURL("/anthropic/callback")
@@ -143,7 +169,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		code := strings.Split(rawCode, "#")[0]
 
 		// Exchange code for tokens using internal auth service
-		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		bundle, errExchange := anthropicAuth.ExchangeCodeForTokensWithRedirect(ctx, code, state, redirectURI, pkceCodes)
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
@@ -192,7 +218,23 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		CompleteOAuthSession(state)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state, "manual": manual})
+}
+
+// anthropicManualOAuth reports whether the Claude login should use Anthropic's
+// hosted callback. The "manual" query parameter overrides the configured default
+// so the flow can be selected per request without editing the config.
+func (h *Handler) anthropicManualOAuth(c *gin.Context) bool {
+	raw := strings.TrimSpace(c.Query("manual"))
+	if raw == "" {
+		return h.cfg != nil && h.cfg.ClaudeCode.ManualOAuth
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {
