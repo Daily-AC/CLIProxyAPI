@@ -194,7 +194,7 @@ waitForCallback:
 	log.Debug("Claude authorization code received; exchanging for tokens")
 	log.Debugf("Code: %s, State: %s", result.Code[:min(20, len(result.Code))], state)
 
-	return a.completeLogin(ctx, authSvc, result.Code, state, claude.RedirectURI, pkceCodes)
+	return a.completeLogin(ctx, cfg, authSvc, result.Code, state, claude.RedirectURI, pkceCodes)
 }
 
 // loginManual runs the manual Claude Code OAuth flow. The user opens the printed
@@ -232,12 +232,12 @@ func (a *ClaudeAuthenticator) loginManual(ctx context.Context, cfg *config.Confi
 		return nil, claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("state mismatch"))
 	}
 
-	return a.completeLogin(ctx, authSvc, code, state, claude.ManualRedirectURI, pkceCodes)
+	return a.completeLogin(ctx, cfg, authSvc, code, state, claude.ManualRedirectURI, pkceCodes)
 }
 
 // completeLogin exchanges an authorization code and shapes the resulting tokens
 // into the credential record shared by both Claude login flows.
-func (a *ClaudeAuthenticator) completeLogin(ctx context.Context, authSvc *claude.ClaudeAuth, code, state, redirectURI string, pkceCodes *claude.PKCECodes) (*coreauth.Auth, error) {
+func (a *ClaudeAuthenticator) completeLogin(ctx context.Context, cfg *config.Config, authSvc *claude.ClaudeAuth, code, state, redirectURI string, pkceCodes *claude.PKCECodes) (*coreauth.Auth, error) {
 	authBundle, err := authSvc.ExchangeCodeForTokensWithRedirect(ctx, code, state, redirectURI, pkceCodes)
 	if err != nil {
 		log.Errorf("Token exchange failed: %v", err)
@@ -266,6 +266,12 @@ func (a *ClaudeAuthenticator) completeLogin(ctx context.Context, authSvc *claude
 	if len(tokenStorage.DeviceIDs) > 0 {
 		metadata[claude.ClaudeDeviceIDsMetadataKey] = append([]string(nil), tokenStorage.DeviceIDs...)
 	}
+	// Carry the OAuth proxy onto the credential so refreshes and inference keep the
+	// route that just completed the exchange; both read the per-credential value.
+	oauthProxyURL := claude.OAuthProxyURL(cfg)
+	if oauthProxyURL != "" {
+		metadata["proxy_url"] = oauthProxyURL
+	}
 
 	fmt.Println("Claude authentication successful")
 	if authBundle.APIKey != "" {
@@ -278,5 +284,6 @@ func (a *ClaudeAuthenticator) completeLogin(ctx context.Context, authSvc *claude
 		FileName: fileName,
 		Storage:  tokenStorage,
 		Metadata: metadata,
+		ProxyURL: oauthProxyURL,
 	}, nil
 }

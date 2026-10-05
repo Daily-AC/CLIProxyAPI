@@ -91,6 +91,7 @@ func TestClaudeOAuthV8FlowCompletes(t *testing.T) {
 			cfg := &config.Config{AuthDir: authDir, Port: 8317}
 			// The query must win over the configured default in both directions.
 			cfg.ClaudeCode.ManualOAuth = tt.manual != "true"
+			cfg.ClaudeCode.ProxyURL = "socks5://127.0.0.1:17890"
 			handler := NewHandlerWithoutConfigFilePath(cfg, nil)
 			service := &fakeClaudeOAuthService{exchanged: make(chan claudeCodeExchange, 1)}
 			originalFactory := newClaudeOAuthService
@@ -201,6 +202,10 @@ func TestClaudeOAuthV8FlowCompletes(t *testing.T) {
 			}
 			if record["email"] != "claude-user@example.test" || record["access_token"] != "access-ac_v8-code" {
 				t.Fatalf("unexpected credential: %v", record)
+			}
+			// Credentials minted by the flow keep the OAuth proxy for refresh and inference.
+			if record["proxy_url"] != "socks5://127.0.0.1:17890" {
+				t.Fatalf("credential proxy_url = %v, want claude-code.proxy-url", record["proxy_url"])
 			}
 		})
 	}

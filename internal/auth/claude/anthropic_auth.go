@@ -200,13 +200,28 @@ func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 	return NewClaudeAuthWithProxyURL(cfg, "")
 }
 
+// OAuthProxyURL reports the proxy dedicated to Claude Code OAuth traffic, if one is
+// configured. It is the fallback the authorization code exchange relies on: that
+// request runs before any credential exists, so there is no per-credential proxy-url
+// to consult yet.
+func OAuthProxyURL(cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.ClaudeCode.ProxyURL)
+}
+
 // NewClaudeAuthWithProxyURL creates a new Anthropic authentication service with a proxy override.
-// proxyURL takes precedence over cfg.ProxyURL when non-empty.
+// The proxy is resolved in descending priority: the proxyURL argument (a credential's own
+// setting at the call sites that have one), then claude-code.proxy-url, then cfg.ProxyURL.
 func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
 	var sdkCfg *config.SDKConfig
 	if cfg != nil {
 		sdkCfgCopy := cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = OAuthProxyURL(cfg)
+		}
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}

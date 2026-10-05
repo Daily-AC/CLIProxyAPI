@@ -405,6 +405,16 @@ upstream:
     # Legacy spelling: claude-code.manual-oauth
     manual-oauth: false
 
+    # Routes Claude Code OAuth traffic through a dedicated proxy without touching requests.proxy-url,
+    # so only Anthropic-bound requests take the detour while every other provider keeps its own route.
+    # Required when this host cannot reach Anthropic at all — a server in a region Anthropic refuses gets
+    # 403 "Request not allowed" on both platform.claude.com and api.anthropic.com — because the
+    # authorization code exchange runs before the credential exists and so cannot read a per-credential
+    # proxy-url. Credentials created by the flow inherit this value, keeping their token refreshes and
+    # inference requests on the same route; a per-credential proxy-url (including "direct") still wins.
+    # Legacy spelling: claude-code.proxy-url
+    # proxy-url: "http://127.0.0.1:32450"
+
     # Anthropic-Beta is assembled per request rather than sent as a fixed list, matching
     # Claude Code: context-1m sits right after claude-code, mid-conversation-system
     # is added only for models that accept a role=system turn, advanced-tool-use only when

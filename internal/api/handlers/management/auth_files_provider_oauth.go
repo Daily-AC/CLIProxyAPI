@@ -193,12 +193,20 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			metadata[claude.ClaudeDeviceIDsMetadataKey] = append([]string(nil), tokenStorage.DeviceIDs...)
 		}
 		fileName := claude.CredentialFileName(tokenStorage.Email, tokenStorage.OrganizationUUID, tokenStorage.AccountUUID)
+		// The credential inherits the OAuth proxy so its refreshes and inference
+		// requests keep the route that just completed the exchange; those paths read
+		// the per-credential value and would otherwise fall back to the global proxy-url.
+		oauthProxyURL := claude.OAuthProxyURL(h.cfg)
+		if oauthProxyURL != "" {
+			metadata["proxy_url"] = oauthProxyURL
+		}
 		record := &coreauth.Auth{
 			ID:       fileName,
 			Provider: "claude",
 			FileName: fileName,
 			Storage:  tokenStorage,
 			Metadata: metadata,
+			ProxyURL: oauthProxyURL,
 		}
 		if errGuard := guardOAuthSessionPendingForSave(state, "anthropic"); errGuard != nil {
 			return

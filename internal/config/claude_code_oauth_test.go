@@ -12,19 +12,26 @@ import (
 // Deployments configured before v8 keep the Claude login settings under the
 // legacy claude-code section; v8 maps that section to upstream.claude.
 const (
-	legacyClaudeCodeOAuthYAML = "claude-code:\n  manual-oauth: true\n"
-	v8ClaudeCodeOAuthYAML     = "config-version: 8\nupstream:\n  claude:\n    manual-oauth: true\n"
+	legacyClaudeCodeOAuthYAML = "claude-code:\n  manual-oauth: true\n  proxy-url: \"socks5://127.0.0.1:17890\"\n"
+	v8ClaudeCodeOAuthYAML     = "config-version: 8\nupstream:\n  claude:\n    manual-oauth: true\n    proxy-url: \"socks5://127.0.0.1:17890\"\n"
 )
 
 // v8ClaudeCodeOAuthPaths lists the v8 locations the legacy settings must land on.
 var v8ClaudeCodeOAuthPaths = map[string]string{
 	"upstream.claude.manual-oauth": "true",
+	"upstream.claude.proxy-url":    "socks5://127.0.0.1:17890",
 }
 
 func assertClaudeCodeOAuthConfig(t *testing.T, cfg *Config) {
 	t.Helper()
 	if !cfg.ClaudeCode.ManualOAuth {
 		t.Fatal("ClaudeCode.ManualOAuth = false, want true")
+	}
+	if got := cfg.ClaudeCode.ProxyURL; got != "socks5://127.0.0.1:17890" {
+		t.Fatalf("ClaudeCode.ProxyURL = %q, want socks5://127.0.0.1:17890", got)
+	}
+	if cfg.ProxyURL != "" {
+		t.Fatalf("global proxy-url = %q, want it untouched", cfg.ProxyURL)
 	}
 }
 
@@ -112,8 +119,10 @@ func TestClaudeCodeOAuthSurvivesConfigSave(t *testing.T) {
 				if err = yaml.Unmarshal(data, &doc); err != nil {
 					t.Fatal(err)
 				}
-				if value := yamlPath(doc.Content[0], "claude-code.manual-oauth"); value == nil || value.Value != "true" {
-					t.Fatalf("v0 save dropped claude-code.manual-oauth:\n%s", data)
+				for path, want := range map[string]string{"claude-code.manual-oauth": "true", "claude-code.proxy-url": "socks5://127.0.0.1:17890"} {
+					if value := yamlPath(doc.Content[0], path); value == nil || value.Value != want {
+						t.Fatalf("v0 save dropped %s:\n%s", path, data)
+					}
 				}
 			}
 
@@ -122,6 +131,42 @@ func TestClaudeCodeOAuthSurvivesConfigSave(t *testing.T) {
 				t.Fatalf("LoadConfig(saved) error = %v", err)
 			}
 			assertClaudeCodeOAuthConfig(t, reloaded)
+		})
+	}
+}
+
+func TestParseConfigBytesClaudeCodeProxyURL(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "defaults to empty so the global proxy-url keeps deciding",
+			yaml: "port: 8317\n",
+			want: "",
+		},
+		{
+			name: "reads a dedicated oauth proxy",
+			yaml: "claude-code:\n  proxy-url: \"http://127.0.0.1:32450\"\n",
+			want: "http://127.0.0.1:32450",
+		},
+		{
+			name: "coexists with manual-oauth",
+			yaml: "claude-code:\n  manual-oauth: true\n  proxy-url: \"socks5://127.0.0.1:1080\"\n",
+			want: "socks5://127.0.0.1:1080",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, errParse := ParseConfigBytes([]byte(tt.yaml))
+			if errParse != nil {
+				t.Fatalf("ParseConfigBytes() error = %v", errParse)
+			}
+			if got := cfg.ClaudeCode.ProxyURL; got != tt.want {
+				t.Fatalf("ClaudeCode.ProxyURL = %q, want %q", got, tt.want)
+			}
 		})
 	}
 }
