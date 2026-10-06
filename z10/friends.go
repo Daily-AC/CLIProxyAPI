@@ -34,7 +34,16 @@ const (
 // usageZone is the time zone used for date-only expiry values and per-day usage buckets.
 var usageZone = time.FixedZone("UTC+8", 8*60*60)
 
-var friendNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+var friendNamePattern = regexp.MustCompile(`^[\p{L}\p{N}_.-]{1,64}$`)
+
+// friendNameRule describes friendNamePattern and the dot rule in error messages.
+const friendNameRule = "1-64 letters, digits, '_', '.' or '-', not only dots"
+
+// validFriendName reports whether name may name a friend. Names made only of dots are
+// rejected because URL normalization removes them from /z10/friends/<name>.
+func validFriendName(name string) bool {
+	return friendNamePattern.MatchString(name) && strings.Trim(name, ".") != ""
+}
 
 // Friend is one validated friend key.
 type Friend struct {
@@ -55,12 +64,29 @@ type Friend struct {
 	providers map[string]struct{}
 }
 
-// inactiveReason returns a non-empty message when the key must be rejected with 401.
-func (f *Friend) inactiveReason(now time.Time) string {
+// Inactive states reported by the admin API.
+const (
+	inactiveDisabled = "disabled"
+	inactiveExpired  = "expired"
+)
+
+// inactiveState returns inactiveDisabled, inactiveExpired, or "" for an active key.
+func (f *Friend) inactiveState(now time.Time) string {
 	if !f.Enabled {
-		return "API key disabled"
+		return inactiveDisabled
 	}
 	if !f.ExpiresAt.IsZero() && !now.Before(f.ExpiresAt) {
+		return inactiveExpired
+	}
+	return ""
+}
+
+// inactiveReason returns a non-empty message when the key must be rejected with 401.
+func (f *Friend) inactiveReason(now time.Time) string {
+	switch f.inactiveState(now) {
+	case inactiveDisabled:
+		return "API key disabled"
+	case inactiveExpired:
 		return "API key expired"
 	}
 	return ""
@@ -197,7 +223,7 @@ type friendEntry struct {
 	Key      string   `yaml:"key"`
 	Models   []string `yaml:"models"`
 	Channels []string `yaml:"channels"`
-	Expires  string   `yaml:"expires"`
+	Expires  string   `yaml:"expires,omitempty"`
 	Enabled  *bool    `yaml:"enabled"`
 }
 
@@ -224,8 +250,8 @@ func ParseFriends(data []byte) (*FriendSet, error) {
 		if name != "" {
 			label = fmt.Sprintf("keys[%d] (%s)", index, name)
 		}
-		if !friendNamePattern.MatchString(name) {
-			problems = append(problems, label+": name must match "+friendNamePattern.String())
+		if !validFriendName(name) {
+			problems = append(problems, label+": name must be "+friendNameRule)
 			continue
 		}
 		if _, exists := set.byName[name]; exists {

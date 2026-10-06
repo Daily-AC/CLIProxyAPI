@@ -301,10 +301,12 @@ func (s *UsageStore) Flush() error {
 	return nil
 }
 
+// writeFileAtomic replaces path with data (plus a trailing newline) through a temp file
+// in the same directory: mode 0600, fsync, then rename.
 func writeFileAtomic(path string, data []byte) (err error) {
 	temp, errCreate := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if errCreate != nil {
-		return fmt.Errorf("create temp usage file: %w", errCreate)
+		return fmt.Errorf("create temp file for %s: %w", filepath.Base(path), errCreate)
 	}
 	tempPath := temp.Name()
 	defer func() {
@@ -314,21 +316,21 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	}()
 	if errChmod := temp.Chmod(0o600); errChmod != nil {
 		_ = temp.Close()
-		return fmt.Errorf("chmod temp usage file: %w", errChmod)
+		return fmt.Errorf("chmod temp file for %s: %w", filepath.Base(path), errChmod)
 	}
 	if _, errWrite := temp.Write(append(data, '\n')); errWrite != nil {
 		_ = temp.Close()
-		return fmt.Errorf("write temp usage file: %w", errWrite)
+		return fmt.Errorf("write temp file for %s: %w", filepath.Base(path), errWrite)
 	}
 	if errSync := temp.Sync(); errSync != nil {
 		_ = temp.Close()
-		return fmt.Errorf("sync temp usage file: %w", errSync)
+		return fmt.Errorf("sync temp file for %s: %w", filepath.Base(path), errSync)
 	}
 	if errClose := temp.Close(); errClose != nil {
-		return fmt.Errorf("close temp usage file: %w", errClose)
+		return fmt.Errorf("close temp file for %s: %w", filepath.Base(path), errClose)
 	}
 	if errRename := os.Rename(tempPath, path); errRename != nil {
-		return fmt.Errorf("replace usage file: %w", errRename)
+		return fmt.Errorf("replace %s: %w", filepath.Base(path), errRename)
 	}
 	return nil
 }
