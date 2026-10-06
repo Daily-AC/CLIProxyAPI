@@ -102,7 +102,9 @@ func defaultChannels() []testChannel {
 	}
 }
 
-func newServerEnv(t *testing.T, channels []testChannel, friendsYAML string) *serverEnv {
+// newServerEnv builds the server. mutate may adjust the server config (for example to
+// enable request logging) before the server is built.
+func newServerEnv(t *testing.T, channels []testChannel, friendsYAML string, mutate ...func(*config.Config)) *serverEnv {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	env := &serverEnv{}
@@ -118,12 +120,22 @@ func newServerEnv(t *testing.T, channels []testChannel, friendsYAML string) *ser
 
 	env.dir = t.TempDir()
 	configPath := filepath.Join(env.dir, "config.yaml")
-	writeTestFile(t, configPath, testConfigYAML)
-	writeTestFile(t, filepath.Join(env.dir, FriendsFileName), friendsYAML)
+	// config.yaml lists the channels so the admin API can validate friend channels.
+	configYAML := testConfigYAML + "openai-compatibility:\n"
+	for _, channel := range channels {
+		configYAML += "  - name: " + channel.Name + "\n    base-url: " + upstream.URL + "/v1\n"
+	}
+	writeTestFile(t, configPath, configYAML)
+	if friendsYAML != "" {
+		writeTestFile(t, filepath.Join(env.dir, FriendsFileName), friendsYAML)
+	}
 
 	cfg := &config.Config{SDKConfig: sdkconfig.SDKConfig{APIKeys: []string{ownerKey}}}
 	cfg.AuthDir = filepath.Join(env.dir, "auths")
 	cfg.RemoteManagement.SecretKey = mgmtKey
+	for _, fn := range mutate {
+		fn(cfg)
+	}
 
 	// Same order as cmd/server/main.go.
 	configaccess.Register(&cfg.SDKConfig)

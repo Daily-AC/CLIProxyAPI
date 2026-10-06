@@ -15,10 +15,13 @@ serverOptions = append(serverOptions, z10.ServerOptions(configFilePath)...)
 ## friends.yaml
 
 Place `friends.yaml` next to `config.yaml` (mode 600). Without the file the feature is off.
+The admin API below creates and edits it; once it is used, the file is machine-managed:
+each write regenerates the whole file from the keys in effect, so comments, formatting
+and hand edits that were rejected by validation are lost.
 
 ```yaml
 keys:
-  - name: alice                # usage is aggregated under this name ([A-Za-z0-9._-], max 64)
+  - name: alice                # usage is aggregated under this name (letters, digits, _ . -; max 64; not only dots)
     key: sk-z10-...            # at least 16 characters, no whitespace
     models: ["deepseek-v4-*", "cline-pass/*"]   # '*' matches any text, case-insensitive
     channels: ["DeepSeek", "ClinePass"]         # required: openai-compatibility names
@@ -96,14 +99,45 @@ most 5 seconds after a change, and on every change once SIGINT/SIGTERM is receiv
 
 ## Admin routes
 
-Both require the management key, checked by the upstream management handler with the
-current `remote-management` settings (`secret-key`, `allow-remote`, `MANAGEMENT_PASSWORD`):
-send `Authorization: Bearer <key>` or `X-Management-Key: <key>`. The runtime-only
-`--password` local password is not accepted.
+All routes require the management key, checked by the upstream management handler with
+the current `remote-management` settings (`secret-key`, `allow-remote`,
+`MANAGEMENT_PASSWORD`): send `Authorization: Bearer <key>` or `X-Management-Key: <key>`.
+The runtime-only `--password` local password is not accepted. Friend keys get `403`.
+Every response has `Cache-Control: no-store`; errors are `{"error":"<message>"}`.
 
 - `GET /z10/usage` returns the usage file content.
-- `GET /z10/friends` returns name, models, channels, expires, enabled, active and
-  last_used. Keys are never returned.
+- `GET /z10/channels` returns `{"channels":[{"name","models"}]}`: the openai-compatibility
+  entries of `config.yaml` that are not disabled, in config order, with the model IDs the
+  model registry currently lists as available for each (sorted). Only these channels can be
+  granted to friends; OAuth, subscription and other API key providers never appear.
+- `GET /z10/friends` returns `{"friends":[...]}` in file order. Each item has `name`,
+  `models`, `channels`, `expires` (omitted when never), `enabled`, `active`,
+  `inactive_reason` (`"disabled"`, `"expired"` or `""`), `last_used` (omitted when never),
+  and the usage totals `requests`, `failed_requests`, `total_tokens`.
+- `POST /z10/friends` with `{"name", "channels", "models"?, "expires"?, "enabled"?}`
+  creates a friend and returns `201 {"friend": <item>, "key": "sk-z10-..."}`. The server
+  generates the key (`sk-z10-` + 32 random bytes, unpadded base64url); this response is the
+  only place a key is ever returned, and the request log records it as `<redacted>`.
+  `models` defaults to `["*"]`, `expires` to never (`""`), `enabled` to `true`.
+- `PATCH /z10/friends/{name}` with any of `{"enabled", "expires", "channels", "models"}`
+  returns `200 {"friend": <item>}`. Absent or `null` fields are unchanged; `"expires": ""`
+  removes the expiry. Names and keys cannot be changed.
+- `DELETE /z10/friends/{name}` returns `204`. The friend's usage history is kept.
+
+Validation (`400` unless noted): the request body is one JSON object without unknown
+fields; `name` matches `^[\p{L}\p{N}_.-]{1,32}$` and is not only dots, and is unique
+(`409`); `channels` is non-empty and each one is an enabled openai-compatibility entry
+(matched case-insensitively and stored as spelled in `config.yaml`); `models` is non-empty
+without blank patterns; `expires` is `YYYY-MM-DD` or RFC3339. An unknown name is `404`.
+`POST` and `PATCH` require `Content-Type: application/json` (`415` otherwise, which blocks
+HTML form posts); a `DELETE` may omit it but must not send another type.
+
+Writes are serialized with reloads. Each write starts from the keys in effect, validates
+the complete new file with the same parser as the loader (including the owner key rule),
+writes it to a temp file (mode 600, fsync) and renames it over `friends.yaml`, creating
+the file if needed. The new keys apply immediately; the watcher's reload of the same file
+changes nothing. When validation or the write fails, nothing changes. Logs name the
+friend (`z10: friend created|updated|deleted name=<name>`), never the key.
 
 ## Known limits
 

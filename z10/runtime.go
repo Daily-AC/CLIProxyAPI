@@ -58,8 +58,10 @@ type Runtime struct {
 	debounce    time.Duration
 	onReload    func(error)
 
-	state    atomic.Pointer[state]
-	reloadMu sync.Mutex
+	state atomic.Pointer[state]
+	// mu serializes reloads and admin writes of friends.yaml, so a reload never stores
+	// a snapshot older than a concurrent write.
+	mu sync.Mutex
 
 	// mgmt authenticates admin routes with the same logic as the management API.
 	mgmt  *sdkapi.Handler
@@ -119,8 +121,8 @@ func (rt *Runtime) Usage() *UsageStore {
 // entries whose key equals an owner key are dropped on every reload, so an owner key is
 // never restricted; the remaining entries stay active.
 func (rt *Runtime) Reload() error {
-	rt.reloadMu.Lock()
-	defer rt.reloadMu.Unlock()
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 
 	previous := rt.state.Load()
 	owner, errOwner := loadOwnerConfig(rt.configPath)
@@ -134,6 +136,13 @@ func (rt *Runtime) Reload() error {
 		log.WithError(errFriends).Error("z10: friends.yaml rejected; keeping last good friend keys")
 		parsed = previous.parsed
 	}
+	errCollision := rt.storeLocked(previous, owner, parsed)
+	return errors.Join(errOwner, errFriends, errCollision)
+}
+
+// storeLocked activates owner settings and parsed friends.yaml content. Friend entries
+// whose key equals an owner key are dropped. rt.mu must be held.
+func (rt *Runtime) storeLocked(previous *state, owner *config.Config, parsed *FriendSet) error {
 	friends, dropped := parsed.withoutKeys(owner.APIKeys)
 	var errCollision error
 	if len(dropped) > 0 {
@@ -149,7 +158,7 @@ func (rt *Runtime) Reload() error {
 	if friendSetSummary(friends) != friendSetSummary(previous.friends) {
 		log.WithField("friends", friends.Len()).Info("z10: friend keys loaded")
 	}
-	return errors.Join(errOwner, errFriends, errCollision)
+	return errCollision
 }
 
 // warnUnknownChannels logs channels that name no openai-compatibility entry. Such a
