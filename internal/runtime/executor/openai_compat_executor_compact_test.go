@@ -1204,3 +1204,57 @@ func TestOpenAICompatExecutorStreamDropsChunksAfterDone(t *testing.T) {
 		t.Fatalf("second chunk = %s", payloads[1])
 	}
 }
+
+func TestOpenAICompatExecutorSpeechPassthrough(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write([]byte("RIFFdata"))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{
+		OpenAICompatibility: []config.OpenAICompatibility{{Name: "compat"}},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "openai-compatibility",
+		Attributes: map[string]string{
+			"base_url":     server.URL + "/v1",
+			"api_key":      "test",
+			"compat_name":  "compat",
+			"provider_key": "compat",
+		},
+	}
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "upstream-tts",
+		Payload: []byte(`{"model":"compat-tts","input":"hi","voice":"manbo","emo_text":"calm"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-speech"),
+		Headers:      http.Header{"Content-Type": []string{"application/json"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute error: %v", err)
+	}
+	if gotPath != "/v1/audio/speech" {
+		t.Fatalf("path = %q, want /v1/audio/speech", gotPath)
+	}
+	if got := gjson.GetBytes(gotBody, "model").String(); got != "upstream-tts" {
+		t.Fatalf("model = %q, want upstream-tts; body=%s", got, gotBody)
+	}
+	if got := gjson.GetBytes(gotBody, "emo_text").String(); got != "calm" {
+		t.Fatalf("extra fields should pass through; body=%s", gotBody)
+	}
+	if string(resp.Payload) != "RIFFdata" || resp.Headers.Get("Content-Type") != "audio/wav" {
+		t.Fatalf("response = %q %q", resp.Payload, resp.Headers.Get("Content-Type"))
+	}
+
+	if _, errStream := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "upstream-tts",
+		Payload: []byte(`{"input":"hi"}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-speech"), Stream: true}); errStream == nil {
+		t.Fatal("expected streaming speech to be rejected")
+	}
+}

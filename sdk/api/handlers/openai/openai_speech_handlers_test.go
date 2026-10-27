@@ -148,3 +148,13 @@ func TestSpeechResponseContentType(t *testing.T) {
 		t.Fatalf("audio upstream = %q", got)
 	}
 }
+
+func TestSniffSpeechContentType(t *testing.T) {
+	wav := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	if got := sniffSpeechContentType(wav); got != "audio/wav" {
+		t.Fatalf("wav sniff = %q", got)
+	}
+	if got := sniffSpeechContentType([]byte(`{"error":"x"}`)); got != "" {
+		t.Fatalf("json sniff = %q, want empty", got)
+	}
+}

@@ -76,3 +76,19 @@ func joinModalities(modalities []string) string {
 	}
 	return out
 }
+
+func TestBuildOpenAICompatibilityConfigModels_Speech(t *testing.T) {
+	models := buildOpenAICompatibilityConfigModels(&config.OpenAICompatibility{
+		Name:   "tts",
+		Models: []config.OpenAICompatibilityModel{{Name: "upstream-tts", Alias: "compat-tts", Speech: true}},
+	})
+	if len(models) != 1 || models[0] == nil {
+		t.Fatalf("models = %#v", models)
+	}
+	if models[0].Type != registry.OpenAISpeechModelType {
+		t.Fatalf("Type = %q, want %q", models[0].Type, registry.OpenAISpeechModelType)
+	}
+	if models[0].Thinking != nil {
+		t.Fatalf("speech model should not advertise thinking: %#v", models[0].Thinking)
+	}
+}

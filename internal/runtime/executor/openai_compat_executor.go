@@ -33,6 +33,8 @@ const (
 	openAICompatImagesGenerationsPath       = "/images/generations"
 	openAICompatImagesEditsPath             = "/images/edits"
 	openAICompatDefaultImageEndpoint        = openAICompatImagesGenerationsPath
+	openAICompatSpeechHandlerType           = "openai-speech"
+	openAICompatAudioSpeechPath             = "/audio/speech"
 	openAICompatMultipartMemory       int64 = 32 << 20
 )
 
@@ -89,6 +91,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImages(ctx, auth, req, opts, endpointPath)
+	}
+	if opts.SourceFormat.String() == openAICompatSpeechHandlerType {
+		// Speech shares the unary media path: JSON body with the upstream model, raw response bytes.
+		return e.executeImages(ctx, auth, req, opts, openAICompatAudioSpeechPath)
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
@@ -321,6 +327,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if endpointPath := openAICompatImageEndpointPath(opts); endpointPath != "" {
 		return e.executeImagesStream(ctx, auth, req, opts, endpointPath)
+	}
+	if opts.SourceFormat.String() == openAICompatSpeechHandlerType {
+		return nil, statusErr{code: http.StatusBadRequest, msg: "streaming not supported for /audio/speech"}
 	}
 
 	baseModel := thinking.ParseSuffix(req.Model).ModelName

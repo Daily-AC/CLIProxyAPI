@@ -10,6 +10,7 @@ import (
 
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -262,7 +263,7 @@ func (h *BaseAPIHandler) validateSpeechOnlyModel(modelName string, allowSpeechMo
 	if baseModel == "" {
 		baseModel = strings.TrimSpace(modelName)
 	}
-	if isXAISpeechOnlyModel(baseModel) && !allowSpeechModel {
+	if (isXAISpeechOnlyModel(baseModel) || IsOpenAICompatSpeechModel(baseModel)) && !allowSpeechModel {
 		return &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
 			Error:      fmt.Errorf("model %s is only supported on /v1/audio/speech and /v1/tts", routeModelBaseName(baseModel)),
@@ -278,6 +279,16 @@ func isXAISpeechOnlyModel(model string) bool {
 	default:
 		return false
 	}
+}
+
+// IsOpenAICompatSpeechModel reports whether model is an openai-compatibility model configured with speech: true.
+func IsOpenAICompatSpeechModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	info := registry.LookupModelInfo(model)
+	return info != nil && info.Type == registry.OpenAISpeechModelType
 }
 
 func routeModelBaseName(model string) string {

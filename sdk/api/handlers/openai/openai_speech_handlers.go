@@ -42,14 +42,16 @@ var openAISpeechVoices = map[string]string{
 }
 
 func (h *OpenAIAPIHandler) AudioSpeech(c *gin.Context) {
-	h.handleXAISpeech(c)
+	h.handleXAISpeech(c, true)
 }
 
 func (h *OpenAIAPIHandler) XAITTS(c *gin.Context) {
-	h.handleXAISpeech(c)
+	h.handleXAISpeech(c, false)
 }
 
-func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context) {
+// handleXAISpeech serves Grok speech. With allowCompat, configured openai-compatibility
+// speech models receive the OpenAI request body unchanged instead.
+func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context, allowCompat bool) {
 	raw, err := handlers.ReadRequestBody(c)
 	if err != nil {
 		writeSpeechError(c, clienterror.HTTPStatusFromErrorOr(err, http.StatusBadRequest), fmt.Sprintf("Invalid request: %v", err))
@@ -61,15 +63,28 @@ func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context) {
 	}
 
 	requested := strings.TrimSpace(gjson.GetBytes(raw, "model").String())
-	model, ok := speechRoutingModel(requested)
-	if !ok {
-		writeSpeechError(c, http.StatusBadRequest, fmt.Sprintf("Model %s is not supported on /v1/audio/speech. Use %s.", requested, defaultXAISpeechModel))
-		return
-	}
-	payload, format, err := buildXAISpeechPayload(raw)
-	if err != nil {
-		writeSpeechError(c, http.StatusBadRequest, err.Error())
-		return
+	var model, format string
+	var payload []byte
+	compat := allowCompat && handlers.IsOpenAICompatSpeechModel(requested)
+	if compat {
+		if !gjson.ValidBytes(raw) {
+			writeSpeechError(c, http.StatusBadRequest, "body must be valid JSON")
+			return
+		}
+		model, payload = requested, raw
+		format = strings.ToLower(strings.TrimSpace(gjson.GetBytes(raw, "response_format").String()))
+	} else {
+		routed, ok := speechRoutingModel(requested)
+		if !ok {
+			writeSpeechError(c, http.StatusBadRequest, fmt.Sprintf("Model %s is not supported on /v1/audio/speech. Use %s or a configured openai-compatibility speech model.", requested, defaultXAISpeechModel))
+			return
+		}
+		model = routed
+		payload, format, err = buildXAISpeechPayload(raw)
+		if err != nil {
+			writeSpeechError(c, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
@@ -85,7 +100,14 @@ func (h *OpenAIAPIHandler) handleXAISpeech(c *gin.Context) {
 		return
 	}
 
-	c.Header("Content-Type", speechResponseContentType(format, upstreamHeaders.Get("Content-Type")))
+	contentType := speechResponseContentType(format, upstreamHeaders.Get("Content-Type"))
+	if compat && speechContentTypeNeedsDefault(upstreamHeaders.Get("Content-Type")) {
+		// Upstream headers are dropped unless passthrough-headers is on, so trust the audio bytes.
+		if sniffed := sniffSpeechContentType(resp); sniffed != "" {
+			contentType = sniffed
+		}
+	}
+	c.Header("Content-Type", contentType)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	c.Writer.Header().Del("Content-Length")
 	_, _ = c.Writer.Write(resp)
@@ -239,6 +261,18 @@ func speechContentTypeNeedsDefault(contentType string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// sniffSpeechContentType reports the audio media type of body, or "" when it is not recognizable audio.
+func sniffSpeechContentType(body []byte) string {
+	switch sniffed := http.DetectContentType(body); {
+	case sniffed == "audio/wave":
+		return "audio/wav"
+	case strings.HasPrefix(sniffed, "audio/"):
+		return sniffed
+	default:
+		return ""
 	}
 }
 
