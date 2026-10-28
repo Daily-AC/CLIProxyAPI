@@ -239,10 +239,17 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			appendRegularMessage(message)
 		}
 
+		// Developer instructions before the conversation starts keep system authority.
+		// Later developer text stays user text for providers that reject system
+		// messages after the first user or assistant turn.
+		conversationStarted := false
 		for _, item := range inputItems {
 			itemType := item.Get("type").String()
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
+			}
+			if itemType != "message" {
+				conversationStarted = true
 			}
 			if itemType != "function_call" && itemType != "custom_tool_call" {
 				flushPendingToolCalls()
@@ -256,7 +263,14 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				// but never counts as the user's own turn.
 				isUserTurn := role == "user"
 				if role == "developer" {
-					role = "user"
+					if conversationStarted {
+						role = "user"
+					} else {
+						role = "system"
+					}
+				}
+				if role != "system" {
+					conversationStarted = true
 				}
 				mergeableAssistantIndex = -1
 				if role != "assistant" {

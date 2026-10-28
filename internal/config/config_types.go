@@ -899,6 +899,12 @@ type OpenAICompatibility struct {
 	// SupportPromptCacheKey enables derived prompt_cache_key injection for supported requests.
 	SupportPromptCacheKey bool `yaml:"support-prompt-cache-key,omitempty" json:"support-prompt-cache-key,omitempty"`
 
+	// WireAPI selects the upstream protocol for OpenAI Responses requests.
+	// "responses" forwards /v1/responses requests to the provider's /responses endpoint
+	// without translating them to Chat Completions. Other source formats, and the
+	// default empty value, keep using /chat/completions.
+	WireAPI string `yaml:"wire-api,omitempty" json:"wire-api,omitempty"`
+
 	// DisableCooling overrides the global cooling policy for this provider when set.
 	// True disables auth/model cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
