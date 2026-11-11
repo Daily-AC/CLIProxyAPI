@@ -49,9 +49,11 @@ func TestAntigravityLatestVersionUsesCurrentHubFallback(t *testing.T) {
 }
 
 // Cloud Code resolves newer models only for clients reporting at least 2.9.0;
-// older versions get 404 Requested entity was not found.
+// older versions get 404 Requested entity was not found. fetchAvailableModels
+// leaves out the gemini-4 models below 2.29.0, and a restart can probe before
+// the hub manifest arrives, so the fallback alone has to unlock them.
 func TestAntigravityFallbackVersionMeetsBackendFloor(t *testing.T) {
-	const floorMajor, floorMinor = 2, 9
+	const floorMajor, floorMinor = 2, 29
 
 	var major, minor, patch int
 	if _, err := fmt.Sscanf(antigravityFallbackVersion, "%d.%d.%d", &major, &minor, &patch); err != nil {

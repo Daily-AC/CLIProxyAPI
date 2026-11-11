@@ -18,9 +18,10 @@ import (
 const (
 	// antigravityFallbackVersion is the client version reported when the hub
 	// manifest has not been fetched yet or cannot be reached. Cloud Code rejects
-	// newer models for clients below 2.9.0, so this floor must stay at or above
-	// that version.
-	antigravityFallbackVersion = "2.9.1"
+	// newer models for clients below 2.9.0 and hides the gemini-4 models below
+	// 2.29.0 (2026-11-11: 2.9.1 got 23 models, 2.29.0 got 27), so this floor
+	// must stay at or above that version. Upstream f72f8bfd made the same bump.
+	antigravityFallbackVersion = "2.29.0"
 	antigravityHubPlatform     = "darwin/arm64"
 	antigravityVersionCacheTTL = 6 * time.Hour
 	antigravityFetchTimeout    = 10 * time.Second
