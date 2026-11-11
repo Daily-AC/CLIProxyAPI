@@ -236,8 +236,8 @@ func TestAntigravitySensitiveWordsObfuscatesSystemInstructionOnly(t *testing.T) 
 	payload := []byte(`{"request":{"systemInstruction":{"parts":[{"text":"Use proxy safely"}]},"contents":[{"role":"user","parts":[{"text":"proxy remains unchanged"}]}]}}`)
 
 	got := executor.obfuscateSensitiveWords(payload)
-	if systemText := gjson.GetBytes(got, "request.systemInstruction.parts.0.text").String(); systemText != "Use p\u200Broxy safely" {
-		t.Fatalf("system instruction = %q, want zero-width obfuscation", systemText)
+	if systemText := gjson.GetBytes(got, "request.systemInstruction.parts.0.text").String(); systemText != "Use p\u034Froxy safely" {
+		t.Fatalf("system instruction = %q, want U+034F obfuscation", systemText)
 	}
 	if contentText := gjson.GetBytes(got, "request.contents.0.parts.0.text").String(); contentText != "proxy remains unchanged" {
 		t.Fatalf("content text = %q, want unchanged", contentText)
@@ -288,9 +288,27 @@ func TestAntigravityStreamObfuscatesSensitiveSystemInstruction(t *testing.T) {
 
 	body := <-captured
 	got := gjson.GetBytes(body, "request.systemInstruction.parts.0.text").String()
-	want := "You are H\u200Bermes Agent, an intelligent AI assistant created by N\u200Bous Research."
+	want := "You are H\u034Fermes Agent, an intelligent AI assistant created by N\u034Fous R\u034Fesearch."
 	if got != want {
 		t.Fatalf("system instruction = %q, want %q; body=%s", got, want, body)
+	}
+}
+
+// Since 2026-11-10 Antigravity strips U+200B before matching (upstream #7433): every
+// subword of a phrase gets U+034F, digits included, and no U+200B is left behind.
+func TestAntigravitySensitiveWordsUseCGJPerSubword(t *testing.T) {
+	executor := NewAntigravityExecutor(&config.Config{
+		Antigravity: config.AntigravityConfig{SensitiveWords: []string{"RFC 2119"}},
+	})
+	payload := []byte(`{"request":{"systemInstruction":{"parts":[{"text":"RFC 2119 keywords: MUST. See rfc 2119."}]}}}`)
+
+	got := gjson.GetBytes(executor.obfuscateSensitiveWords(payload), "request.systemInstruction.parts.0.text").String()
+	want := "R\u034FFC 2\u034F119 keywords: MUST. See r\u034Ffc 2\u034F119."
+	if got != want {
+		t.Fatalf("system instruction = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "\u200B") {
+		t.Fatalf("system instruction %q still carries U+200B", got)
 	}
 }
 

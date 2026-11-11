@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
@@ -13,9 +14,25 @@ import (
 // zeroWidthSpace is the Unicode zero-width space character used for obfuscation.
 const zeroWidthSpace = "\u200B"
 
+// combiningGraphemeJoiner (U+034F) obfuscates Antigravity system instructions: since
+// 2026-11-10 Antigravity strips U+200B before matching blocked phrases (upstream #7433).
+const combiningGraphemeJoiner = "\u034F"
+
 // SensitiveWordMatcher holds the compiled regex for matching sensitive words.
 type SensitiveWordMatcher struct {
 	regex *regexp.Regexp
+	// obfuscate rewrites one match; nil means obfuscateWord (U+200B).
+	obfuscate func(string) string
+}
+
+// BuildAntigravitySensitiveWordMatcher is BuildSensitiveWordMatcher with per-subword
+// U+034F obfuscation, ported from upstream 9a7e1e6b without its literal replacements.
+func BuildAntigravitySensitiveWordMatcher(words []string) *SensitiveWordMatcher {
+	m := BuildSensitiveWordMatcher(words)
+	if m != nil {
+		m.obfuscate = obfuscateAntigravityPhrase
+	}
+	return m
 }
 
 // BuildSensitiveWordMatcher compiles a regex from the word list.
@@ -73,10 +90,75 @@ func obfuscateWord(word string) string {
 	return string(r) + zeroWidthSpace + word[size:]
 }
 
+func isAntigravitySubwordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '\u034F' || r == '\u200B'
+}
+
+func obfuscateSingleSubwordCGJ(subword string) (string, bool) {
+	if strings.Contains(subword, combiningGraphemeJoiner) {
+		return subword, true
+	}
+	r, size := utf8.DecodeRuneInString(subword)
+	if r == utf8.RuneError || size >= len(subword) {
+		return subword, false
+	}
+	return string(r) + combiningGraphemeJoiner + subword[size:], true
+}
+
+// obfuscateAntigravityPhrase inserts U+034F after the first rune of every
+// alphanumeric subword (>= 2 runes) within phrase, preserving punctuation and whitespace.
+func obfuscateAntigravityPhrase(phrase string) string {
+	if phrase == "" || strings.Contains(phrase, combiningGraphemeJoiner) {
+		return phrase
+	}
+
+	var b strings.Builder
+	b.Grow(len(phrase) + len(combiningGraphemeJoiner)*2)
+	subwordStart := -1
+	inserted := false
+
+	for i, r := range phrase {
+		if isAntigravitySubwordRune(r) {
+			if subwordStart < 0 {
+				subwordStart = i
+			}
+			continue
+		}
+		if subwordStart >= 0 {
+			obf, did := obfuscateSingleSubwordCGJ(phrase[subwordStart:i])
+			b.WriteString(obf)
+			if did {
+				inserted = true
+			}
+			subwordStart = -1
+		}
+		b.WriteRune(r)
+	}
+	if subwordStart >= 0 {
+		obf, did := obfuscateSingleSubwordCGJ(phrase[subwordStart:])
+		b.WriteString(obf)
+		if did {
+			inserted = true
+		}
+	}
+
+	if inserted {
+		return b.String()
+	}
+	r, size := utf8.DecodeRuneInString(phrase)
+	if r == utf8.RuneError || size >= len(phrase) {
+		return phrase
+	}
+	return string(r) + combiningGraphemeJoiner + phrase[size:]
+}
+
 // obfuscateText replaces all sensitive words in the text.
 func (m *SensitiveWordMatcher) obfuscateText(text string) string {
 	if m == nil || m.regex == nil {
 		return text
+	}
+	if m.obfuscate != nil {
+		return m.regex.ReplaceAllStringFunc(text, m.obfuscate)
 	}
 	return m.regex.ReplaceAllStringFunc(text, obfuscateWord)
 }

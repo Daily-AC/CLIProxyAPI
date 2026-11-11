@@ -69,7 +69,7 @@ func (e *AntigravityExecutor) obfuscateSensitiveWords(payload []byte) []byte {
 	if e == nil || e.cfg == nil || len(e.cfg.Antigravity.SensitiveWords) == 0 {
 		return payload
 	}
-	matcher := helps.BuildSensitiveWordMatcher(e.cfg.Antigravity.SensitiveWords)
+	matcher := helps.BuildAntigravitySensitiveWordMatcher(e.cfg.Antigravity.SensitiveWords)
 	return helps.ObfuscateSensitiveWordsInSystemInstruction(payload, matcher)
 }
 
