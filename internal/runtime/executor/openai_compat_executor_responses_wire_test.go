@@ -133,6 +133,8 @@ func TestOpenAICompatExecutorResponsesWireKeepsChatForOtherCases(t *testing.T) {
 	}{
 		{"responses source without wire-api", "", "openai-response", responsesWireRequest},
 		{"chat source with wire-api", "responses", "openai", `{"model":"ds-alias","stream":true,"messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`},
+		{"namespace tools with wire-api", "responses", "openai-response", `{"model":"ds-alias","stream":true,"tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}},{"type":"namespace","name":"clock","tools":[{"type":"function","name":"curr_time","parameters":{"type":"object"}}]}],"input":[{"role":"developer","content":"You are an agent."},{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
+		{"hosted web_search with wire-api", "responses", "openai-response", `{"model":"ds-alias","stream":true,"tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}},{"type":"web_search"}],"input":[{"role":"developer","content":"You are an agent."},{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -156,5 +158,28 @@ func TestOpenAICompatExecutorResponsesWireKeepsChatForOtherCases(t *testing.T) {
 				t.Fatalf("messages[0].role = %q, want system: %s", got, *gotBody)
 			}
 		})
+	}
+}
+
+func TestOpenAICompatExecutorResponsesWireKeepsFunctionToolsNative(t *testing.T) {
+	executor, auth, gotPath, gotBody := newResponsesWireTestExecutor(t, "responses")
+	payload := `{"model":"ds-alias","stream":true,"tools":[{"type":"function","name":"read","parameters":{"type":"object"}}],"input":[{"role":"developer","content":"You are an agent."},{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "deepseek-v4.1-flash",
+		Payload: []byte(payload),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("openai-response"), Stream: true})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+	}
+	if *gotPath != "/v1/responses" {
+		t.Fatalf("path = %q, want /v1/responses", *gotPath)
+	}
+	if got := gjson.GetBytes(*gotBody, "tools.0.name").String(); got != "read" {
+		t.Fatalf("tools[0].name = %q, want read: %s", got, *gotBody)
 	}
 }

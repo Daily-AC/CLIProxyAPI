@@ -143,6 +143,37 @@ func TestCodexClientHidesSpeechModels(t *testing.T) {
 	}
 }
 
+func TestCodexClientHidesImageGeneratorIDs(t *testing.T) {
+	for _, id := range []string{"gpt-image-1", "gpt-image-3", "gemini-3.1-flash-image", "antigravity/gemini-3.1-flash-image"} {
+		if !isCodexClientImageOrVideoModel(id) {
+			t.Fatalf("%s should be hidden from the Codex chat catalog", id)
+		}
+	}
+	for _, id := range []string{"gemini-3-flash", "deepseek-v4-flash-vision-exp", "gpt-6-astra"} {
+		if isCodexClientImageOrVideoModel(id) {
+			t.Fatalf("%s should stay visible", id)
+		}
+	}
+}
+
+func TestCodexClientHidesConfiguredSpeechModel(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("test-speech-catalog", "openai-compatibility", []*registry.ModelInfo{{
+		ID:   "tts-catalog-test",
+		Type: registry.OpenAISpeechModelType,
+	}})
+	t.Cleanup(func() { reg.UnregisterClient("test-speech-catalog") })
+
+	resp := BuildResponse([]map[string]any{{"id": "tts-catalog-test"}}, nil, false)
+	models, _ := resp["models"].([]map[string]any)
+	if len(models) != 1 {
+		t.Fatalf("models = %#v", resp["models"])
+	}
+	if got, _ := models[0]["visibility"].(string); got != "hide" {
+		t.Fatalf("speech model visibility = %q, want hide", got)
+	}
+}
+
 func TestCodexClientModelsResponse_AppliesDisplayNameToTemplateModel(t *testing.T) {
 	resp := BuildResponse([]map[string]any{{
 		"id":           "gpt-5.5",
@@ -1731,5 +1762,35 @@ func assertCodexNullableFieldCleared(t *testing.T, entry map[string]any, key str
 	}
 	if value != nil {
 		t.Errorf("%s = %#v, want null", key, value)
+	}
+}
+
+func TestCodexClientNonTemplateModelWithoutThinkingAdvertisesNoEfforts(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient("test-no-thinking-catalog", "antigravity", []*registry.ModelInfo{
+		{ID: "plain-catalog-test", ContextLength: 114000},
+		{ID: "budget-catalog-test", ContextLength: 200000, Thinking: &registry.ThinkingSupport{Levels: []string{"low", "high"}}},
+	})
+	t.Cleanup(func() { reg.UnregisterClient("test-no-thinking-catalog") })
+
+	resp := BuildResponse([]map[string]any{{"id": "plain-catalog-test"}, {"id": "budget-catalog-test"}}, nil, false)
+	models, _ := resp["models"].([]map[string]any)
+	bySlug := make(map[string]map[string]any, len(models))
+	for _, m := range models {
+		bySlug[stringModelValue(m, "slug")] = m
+	}
+	plain := bySlug["plain-catalog-test"]
+	if levels, _ := plain["supported_reasoning_levels"].([]any); len(levels) != 0 {
+		t.Fatalf("plain model levels = %#v, want none", plain["supported_reasoning_levels"])
+	}
+	if _, exists := plain["default_reasoning_level"]; exists {
+		t.Fatalf("plain model default_reasoning_level = %#v, want absent", plain["default_reasoning_level"])
+	}
+	if got := plain["context_window"]; got != 114000 {
+		t.Fatalf("plain model context_window = %#v, want 114000", got)
+	}
+	levels, _ := bySlug["budget-catalog-test"]["supported_reasoning_levels"].([]any)
+	if len(levels) != 2 {
+		t.Fatalf("thinking model levels = %#v, want low and high", bySlug["budget-catalog-test"]["supported_reasoning_levels"])
 	}
 }

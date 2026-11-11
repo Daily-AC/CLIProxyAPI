@@ -1095,13 +1095,25 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth, req 
 
 // forwardsResponsesWire reports whether a Responses request goes to the provider's
 // /responses endpoint unchanged because the provider sets wire-api: responses.
+// Requests that declare anything other than plain function tools (Codex namespace
+// groups, custom tools, hosted tools such as web_search) take the Chat path:
+// compatible providers reject those tool types, and the translator flattens
+// namespaces and drops hosted tools.
 func (e *OpenAICompatExecutor) forwardsResponsesWire(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) bool {
 	if opts.Alt != "" || !sourceFormatEqual(opts.SourceFormat, sdktranslator.FormatOpenAIResponse) ||
 		!sourceFormatEqual(cliproxyexecutor.ResponseFormatOrSource(opts), sdktranslator.FormatOpenAIResponse) {
 		return false
 	}
 	compat := e.resolveCompatConfig(auth, req)
-	return compat != nil && strings.EqualFold(strings.TrimSpace(compat.WireAPI), "responses")
+	if compat == nil || !strings.EqualFold(strings.TrimSpace(compat.WireAPI), "responses") {
+		return false
+	}
+	for _, tool := range gjson.GetBytes(req.Payload, "tools").Array() {
+		if tool.Get("type").String() != "function" {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {

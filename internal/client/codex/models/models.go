@@ -387,7 +387,7 @@ func applyCodexClientBaseInstructions(entry map[string]any, model map[string]any
 }
 
 func applyCodexClientModelCapabilities(entry map[string]any, id, metadataID string, info *registry.ModelInfo, providersForModel ProvidersForModelFunc, clientVersion string) {
-	if info != nil && info.Type == registry.OpenAIImageModelType {
+	if isCodexClientEndpointOnlyType(info) {
 		entry["visibility"] = "hide"
 		delete(entry, "input_modalities")
 		delete(entry, "supports_image_detail_original")
@@ -668,7 +668,7 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 		if contextWindow <= 0 && info.ContextLength > 0 {
 			contextWindow = info.ContextLength
 		}
-		if info.Type == registry.OpenAIImageModelType {
+		if isCodexClientEndpointOnlyType(info) {
 			entry["visibility"] = "hide"
 			delete(entry, "input_modalities")
 			delete(entry, "supports_image_detail_original")
@@ -678,6 +678,11 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 		if thinkingSupport == nil {
 			thinkingSupport = info.Thinking
 		}
+	}
+	if thinkingSupport == nil {
+		// No known reasoning support: advertise no efforts instead of the
+		// template's GPT levels, which the model would ignore or reject.
+		thinkingSupport = &registry.ThinkingSupport{}
 	}
 	applyCodexClientThinkingMetadata(entry, thinkingSupport, clientVersion)
 
@@ -744,12 +749,22 @@ func applyCodexClientVisibilityOverride(entry map[string]any, id string) {
 	}
 }
 
+// isCodexClientEndpointOnlyType reports models registered for the image or
+// speech endpoints only; the Codex client cannot use them as chat models.
+func isCodexClientEndpointOnlyType(info *registry.ModelInfo) bool {
+	return info != nil && (info.Type == registry.OpenAIImageModelType || info.Type == registry.OpenAISpeechModelType)
+}
+
 // isCodexClientImageOrVideoModel reports catalog IDs that are not chat models.
 // Speech IDs are included so the Codex client does not offer them as text models.
 func isCodexClientImageOrVideoModel(id string) bool {
 	target := strings.TrimSpace(id)
 	if idx := strings.Index(target, "/"); idx != -1 {
 		target = strings.TrimSpace(target[idx+1:])
+	}
+	// Image generators: gpt-image-*, and Gemini image models such as gemini-3.1-flash-image.
+	if strings.HasPrefix(target, "gpt-image-") || strings.HasSuffix(target, "-image") {
+		return true
 	}
 	switch target {
 	case "grok-imagine-image-quality", "gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2.5", "grok-imagine-image", "grok-imagine-image-2.0", "grok-imagine-video", "grok-imagine-video-1.5", "grok-imagine-video-1.5-preview", "grok-tts", "grok-voice-tts-1.0":
